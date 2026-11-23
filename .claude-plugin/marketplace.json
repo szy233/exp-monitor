@@ -1,0 +1,13 @@
+{
+  "name": "exp-monitor",
+  "owner": {
+    "name": "szy233"
+  },
+  "plugins": [
+    {
+      "name": "exp-monitor",
+      "source": "./",
+      "description": "A pane beside the chat that tracks research experiments across several servers: per-project stages, running jobs with time-left estimates, and GPU status."
+    }
+  ]
+}

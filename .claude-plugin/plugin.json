@@ -1,0 +1,75 @@
+{
+  "name": "exp-monitor",
+  "version": "0.6.0",
+  "description": "常驻面板：按项目和阶段以进度条展示多台远程服务器上正在运行的实验",
+  "author": {
+    "name": "szy233"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/szy233/exp-monitor",
+  "repository": "https://github.com/szy233/exp-monitor",
+  "keywords": [
+    "experiments",
+    "monitoring",
+    "gpu",
+    "research",
+    "pane"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "hub": {
+      "type": "string",
+      "title": "中枢服务器",
+      "description": "从本机 ssh 到中枢服务器用的主机名或 ~/.ssh/config 别名；留空表示本机就是中枢",
+      "default": ""
+    },
+    "workers": {
+      "type": "string",
+      "title": "工作服务器",
+      "description": "逗号分隔，从中枢可 ssh 到的主机别名；写 local 表示中枢本机",
+      "default": "local"
+    },
+    "statusDir": {
+      "type": "string",
+      "title": "状态目录",
+      "description": "各服务器上存放实验状态 JSON 的目录",
+      "default": "~/.exp_status"
+    },
+    "intervalSec": {
+      "type": "number",
+      "title": "刷新间隔（秒）",
+      "description": "多久通过 ssh 同步一次状态；时间按半小时取整显示",
+      "default": 1800
+    },
+    "staleMin": {
+      "type": "number",
+      "title": "停滞判定（分钟）",
+      "description": "运行中的 run 超过这么久没有更新就标记为停滞",
+      "default": 60
+    },
+    "autoInit": {
+      "type": "boolean",
+      "title": "首次打开自动初始化",
+      "description": "在一个项目里第一次打开时，自动让 cc 设计阶段、检查服务器；关掉后只能点“初始化”或用 /exp-init",
+      "default": true
+    },
+    "lostHours": {
+      "type": "number",
+      "title": "失联判定（小时）",
+      "description": "运行中的 run 超过这么久没有更新就算失联：不再算作运行中，可以一并清理",
+      "default": 6
+    },
+    "digests": {
+      "type": "boolean",
+      "title": "根据实验记录生成状态文字",
+      "description": "项目的 git 记录或最新笔记有变化时，用 haiku 写一句“正在做什么 / 下一步”并给阶段起短名",
+      "default": true
+    },
+    "projectRoots": {
+      "type": "string",
+      "title": "项目所在目录",
+      "description": "逗号分隔，中枢上在这些目录下找 .claude/exp-monitor.json 来读项目记录",
+      "default": "~/research/*,~/*"
+    }
+  }
+}

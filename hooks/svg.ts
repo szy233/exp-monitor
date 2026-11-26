@@ -171,36 +171,38 @@ export function pills(items: { count: number; label: string; color: string }[], 
 }
 
 /**
- * One machine's GPUs, a row each: its index, a load bar, a memory bar and,
- * at the right, memory in GB and who holds it.
+ * GPUs, a row each: a label (a machine's GPU index, or a cluster job's node),
+ * a load bar, a memory bar and, at the right, load, memory in GB and a note
+ * (who holds it; for a cluster job its name and time left), amber when
+ * `warn` is set.
  */
 export function gpus(
-  list: { index: number; util: number; memUsed: number; memTotal: number; users: string[] }[],
+  list: { label: string; util: number; memUsed: number; memTotal: number; note: string; warn?: boolean }[],
   width: number,
 ) {
   const row = 18
   const size = 11
-  const labelW = 22
-  const textW = Math.min(150, Math.max(96, width * 0.36))
+  const labelW = Math.min(80, Math.max(22, ...list.map(gpu => textWidth(gpu.label, size) + 8)))
+  const longest = Math.max(0, ...list.map(gpu => textWidth(gpu.note, size)))
+  const textW = Math.min(width * 0.55, Math.max(96, 92 + longest))
   const barsW = Math.max(40, width - labelW - textW - 8)
   const utilW = barsW * 0.5 - 3
   const memW = barsW * 0.5 - 3
   const parts: string[] = []
   list.forEach((gpu, i) => {
-    const y = i * row
-    const cy = y + row / 2
+    const cy = i * row + row / 2
     const busy = gpu.util >= 60 ? HUE.running : gpu.util >= 10 ? '#7aa7f0' : HUE.label
     const mem = gpu.memTotal ? gpu.memUsed / gpu.memTotal : 0
     const memColor = mem >= 0.9 ? HUE.stale : HUE.done
     const gb = (mib: number) => (mib / 1024 >= 10 ? Math.round(mib / 1024) : Math.round(mib / 102.4) / 10)
-    const who = gpu.users.length ? gpu.users.join(',') : '空闲'
+    const ink = gpu.warn ? HUE.stale : HUE.label
     parts.push(
-      `<text x="0" y="${cy}" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${HUE.label}">${gpu.index}</text>`,
+      `<text x="0" y="${cy}" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${HUE.label}">${esc(fit(gpu.label, size, labelW - 4))}</text>`,
       `<rect x="${labelW}" y="${cy - 3}" width="${utilW}" height="6" rx="3" fill="${HUE.track}"/>`,
-      gpu.util > 0 ? `<rect x="${labelW}" y="${cy - 3}" width="${Math.max(6, (clamp(gpu.util / 100) * utilW)).toFixed(1)}" height="6" rx="3" fill="${busy}"/>` : '',
+      gpu.util > 0 ? `<rect x="${labelW}" y="${cy - 3}" width="${Math.max(6, clamp(gpu.util / 100) * utilW).toFixed(1)}" height="6" rx="3" fill="${busy}"/>` : '',
       `<rect x="${labelW + utilW + 6}" y="${cy - 3}" width="${memW}" height="6" rx="3" fill="${HUE.track}"/>`,
       mem > 0.01 ? `<rect x="${labelW + utilW + 6}" y="${cy - 3}" width="${Math.max(6, mem * memW).toFixed(1)}" height="6" rx="3" fill="${memColor}"/>` : '',
-      `<text x="${width}" y="${cy}" text-anchor="end" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${HUE.label}">${gpu.util}% · ${gb(gpu.memUsed)}/${gb(gpu.memTotal)}G · ${esc(fit(who, size, textW - 90))}</text>`,
+      `<text x="${width}" y="${cy}" text-anchor="end" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${ink}">${gpu.util}% · ${gb(gpu.memUsed)}/${gb(gpu.memTotal)}G · ${esc(fit(gpu.note, size, textW - 90))}</text>`,
     )
   })
   return { source: svg(width, list.length * row, parts.join('')), height: list.length * row }

@@ -2,10 +2,12 @@
 // hub runs, parsing what they print, estimates, and the views drawn from them.
 
 import type { Digest, Gpu, HostState, Plan, Run, RunStatus, Snapshot, Stage, StageStatus } from '../types'
+import { clusterScript, parseSlurm } from './slurm'
 
 export type Options = {
   hub: string
   workers: string[]
+  clusters: string[]
   statusDir: string
   intervalSec: number
   staleMin: number
@@ -27,6 +29,7 @@ export function readOptions(raw: Record<string, unknown>): Options {
   return {
     hub: SAFE_HOST.test(String(raw.hub ?? '').trim()) ? String(raw.hub).trim() : '',
     workers: list(raw.workers, 'local').filter(host => SAFE_HOST.test(host)),
+    clusters: list(raw.clusters, '').filter(host => SAFE_HOST.test(host)),
     statusDir: SAFE_PATH.test(dir) ? dir.replace(/\/+$/, '') : '~/.exp_status',
     intervalSec: Math.max(10, Number(raw.intervalSec) || 1800),
     staleMin: Math.max(1, Number(raw.staleMin) || 60),
@@ -55,16 +58,33 @@ function workerScript(dir: string) {
 // shell's own parsing (zsh stops a whole line at a glob that matches nothing).
 const heredoc = (tag: string, body: string) => `<<'${tag}'\n${body}\n${tag}`
 
+/**
+ * The machines a refresh reads: the plugin's own and every project's, the
+ * same in every session. A login node listed as a cluster is read as one
+ * and not again as a plain worker.
+ */
+export function withFleet(opts: Options, fleet: Fleet): Options {
+  const clusters = [...new Set([...opts.clusters, ...fleet.clusters])]
+  const workers = [...new Set([...opts.workers, ...fleet.workers])].filter(host => !clusters.includes(host))
+  return { ...opts, workers, clusters }
+}
+
 /** The one script a refresh runs on the hub. */
 export function hubScript(opts: Options): string {
   const hosts = opts.workers.join(' ')
+  const clusters = opts.clusters.join(' ')
   const configs = opts.projectRoots.map(root => `${root}/.claude/exp-monitor.json`).join(' ')
+  const ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=6'
   return [
     't=$(mktemp -d)',
     `cat > "$t/w.sh" ${heredoc('EXP_WORKER', workerScript(opts.statusDir))}`,
-    `for h in ${hosts}; do (if [ "$h" = local ]; then sh "$t/w.sh"; else ssh -o BatchMode=yes -o ConnectTimeout=6 "$h" sh -s < "$t/w.sh"; fi) > "$t/$h.out" 2>&1 || echo "@@ERR" >> "$t/$h.out" & done`,
+    `cat > "$t/c.sh" ${heredoc('EXP_CLUSTER', clusterScript(opts.statusDir))}`,
+    // Workers and clusters are read at once; a slow or dead one holds up only itself.
+    `for h in ${hosts}; do (if [ "$h" = local ]; then sh "$t/w.sh"; else ${ssh} "$h" sh -s < "$t/w.sh"; fi) > "$t/w_$h.out" 2>&1 || echo "@@ERR" >> "$t/w_$h.out" & done`,
+    `for h in ${clusters}; do (if [ "$h" = local ]; then sh "$t/c.sh"; else ${ssh} "$h" sh -s < "$t/c.sh"; fi) > "$t/c_$h.out" 2>&1 || echo "@@ERR" >> "$t/c_$h.out" & done`,
     'wait',
-    `for h in ${hosts}; do echo "@@HOST $h"; cat "$t/$h.out"; done`,
+    `for h in ${hosts}; do echo "@@HOST $h"; cat "$t/w_$h.out"; done`,
+    `for h in ${clusters}; do echo "@@CLUSTER $h"; cat "$t/c_$h.out"; done`,
     'rm -rf "$t"',
     // Each initialized project on the hub: its config and its latest records,
     // the git log where it is a repository, else the tail of its newest notes.
@@ -123,6 +143,7 @@ function toRun(raw: Record<string, unknown>, where: string, file?: string): Run 
     note: raw.note === undefined || raw.note === null ? undefined : String(raw.note),
     where,
     file,
+    slurm: raw.slurmJob ? { id: String(raw.slurmJob), name: String(raw.name ?? id), state: '', elapsed: 0, gpus: 0 } : undefined,
   }
 }
 
@@ -158,16 +179,21 @@ function toPlan(raw: Record<string, unknown>, where: string, file?: string): Pla
 /** A project's latest records as the hub printed them. */
 export type Notes = { project: string; root: string; sig: string; text: string }
 
-export type Parsed = { runs: Run[]; plans: Plan[]; hosts: HostState[]; notes: Notes[] }
+/** The machines one initialized project names in its `.claude/exp-monitor.json`. */
+export type Fleet = { workers: string[]; clusters: string[] }
+
+export type Parsed = { runs: Run[]; plans: Plan[]; hosts: HostState[]; notes: Notes[]; fleet: Fleet }
 
 export function parse(stdout: string): Parsed {
   const runs: Run[] = []
   const plans = new Map<string, Plan>()
   const hosts: HostState[] = []
   const notes: Notes[] = []
+  const fleet: Fleet = { workers: [], clusters: [] }
   let host: HostState | undefined
   let chunk: { file?: string; lines: string[] } | undefined
-  let section: 'files' | 'gpu' | 'apps' | 'hub' = 'files'
+  let section: 'files' | 'gpu' | 'apps' | 'hub' | 'slurm' = 'files'
+  let slurm: string[] = []
   let noise: string[] = []
   const uuids = new Map<string, Gpu>()
   let root: { path: string; config: string[]; sig: string; text: string[]; inConfig: boolean } | undefined
@@ -194,17 +220,25 @@ export function parse(stdout: string): Parsed {
   }
   const closeHost = () => {
     closeFile()
+    if (host && slurm.length) host.cluster = parseSlurm(slurm)
     if (host && !host.isOk) host.error = noise.join(' ').slice(0, 160) || 'ssh 失败'
     host = undefined
+    slurm = []
     noise = []
     uuids.clear()
   }
   const closeRoot = () => {
     if (!root) return
     try {
-      const config = JSON.parse(root.config.join('\n')) as { project?: unknown; skip?: unknown }
+      const config = JSON.parse(root.config.join('\n')) as { project?: unknown; skip?: unknown; workers?: unknown; clusters?: unknown }
       if (typeof config.project === 'string' && !config.skip && root.sig) {
         notes.push({ project: config.project, root: root.path, sig: root.sig, text: root.text.join('\n').slice(-4000) })
+      }
+      if (!config.skip) {
+        for (const key of ['workers', 'clusters'] as const) {
+          const list = config[key]
+          if (Array.isArray(list)) fleet[key].push(...list.map(String).filter(host => SAFE_HOST.test(host)))
+        }
       }
     } catch {
       // An unreadable config names no project.
@@ -227,11 +261,22 @@ export function parse(stdout: string): Parsed {
       else root.text.push(line)
       continue
     }
-    if (text.startsWith('@@HOST ')) {
+    // A cluster's scheduler lines run from its name to the next host.
+    const isBoundary = text.startsWith('@@HOST ') || text.startsWith('@@CLUSTER ') || text === '@@HUB' || text === '@@ERR'
+    if (section === 'slurm' && !isBoundary) {
+      slurm.push(line)
+      continue
+    }
+    if (text.startsWith('@@HOST ') || text.startsWith('@@CLUSTER ')) {
       closeHost()
-      host = { host: text.slice(7), isOk: true, count: 0 }
+      const isCluster = text.startsWith('@@CLUSTER ')
+      host = { host: text.slice(isCluster ? 10 : 7), isOk: true, count: 0 }
       hosts.push(host)
       section = 'files'
+    } else if (text.startsWith('@@CNAME') && host) {
+      closeFile()
+      section = 'slurm'
+      slurm.push(line)
     } else if (text === '@@HUB') {
       closeHost()
       section = 'hub'
@@ -281,7 +326,7 @@ export function parse(stdout: string): Parsed {
   }
   closeHost()
   closeRoot()
-  return { runs, plans: [...plans.values()], hosts, notes }
+  return { runs, plans: [...plans.values()], hosts, notes, fleet }
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -409,8 +454,11 @@ export function projects(snap: Snapshot, opts: Options): ProjectView[] {
     // Without a plan the stages are the ones the runs name, by first start.
     const declared: Stage[] = plan?.stages.length
       ? [...plan.stages]
-      : [...new Set([...runs].sort((a, b) => (a.started ?? 0) - (b.started ?? 0)).map(run => run.stage))].map(id => ({ id, title: id }))
-    for (const run of runs) if (!declared.some(stage => stage.id === run.stage)) declared.push({ id: run.stage, title: run.stage })
+      : [...new Set([...runs].sort((a, b) => (a.started ?? 0) - (b.started ?? 0)).map(run => run.stage))]
+          .filter(Boolean)
+          .map(id => ({ id, title: id }))
+    // A cluster job found only through the scheduler names no stage.
+    for (const run of runs) if (run.stage && !declared.some(stage => stage.id === run.stage)) declared.push({ id: run.stage, title: run.stage })
     const stages: StageView[] = declared.map(stage => {
       const mine = runs.filter(run => run.stage === stage.id && !isLost(run, at, opts))
       const status = stage.status ?? inferStage(mine)
@@ -446,8 +494,15 @@ export function projects(snap: Snapshot, opts: Options): ProjectView[] {
       queued,
       ended,
       lastActive,
-      // Nothing running, and either closed by cc or quiet for three days.
-      isIdle: live.length === 0 && (plan?.status === 'done' || plan?.status === 'failed' || plan?.status === 'paused' || at - lastActive > 3 * 86400),
+      // Nothing running, and either closed by cc or quiet for three days; a
+      // cluster's unsorted jobs fold away as soon as none runs or waits.
+      isIdle:
+        live.length === 0 &&
+        (plan?.status === 'done' ||
+          plan?.status === 'failed' ||
+          plan?.status === 'paused' ||
+          at - lastActive > 3 * 86400 ||
+          (project.startsWith('cluster:') && queued.length === 0)),
       digest: snap.digests[project],
     })
   }
@@ -526,12 +581,13 @@ export function summary(snap: Snapshot, opts: Options, now: number): string {
   const views = projects(snap, opts)
   const live = views.reduce((n, view) => n + view.live.length, 0)
   const machine = new Map(snap.hosts.flatMap(host => [host.host, ...(host.aliases ?? [])].map(alias => [alias, host.hostname ?? host.host] as const)))
-  const hostOf = (run: Run) => (run.host === run.where ? machine.get(run.where) ?? run.host : run.host)
+  const hostOf = (run: Run) => run.slurm?.node ?? (run.host === run.where ? machine.get(run.where) ?? run.host : run.host)
   const lines = [`${clock(snap.fetchedAt)} 同步 · ${views.length} 个项目 · ${live} 个运行中`]
   for (const view of views.filter(one => !one.isIdle)) {
     const done = view.stages.filter(stage => stage.status === 'done').length
     lines.push(
-      `- ${view.title}：${pct(view.ratio)}，阶段 ${done}/${view.stages.length}` +
+      `- ${view.title}` +
+        (view.stages.length ? `：${pct(view.ratio)}，阶段 ${done}/${view.stages.length}` : '') +
         (view.digest?.now ? `，正在 ${view.digest.now}` : view.current ? `，当前「${view.current.title}」` : ''),
     )
     for (const run of view.live) {

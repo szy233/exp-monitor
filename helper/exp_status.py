@@ -41,7 +41,7 @@ DEFAULT_PROJECT = os.environ.get("EXP_PROJECT", "default")
 
 class ExpStatus:
     def __init__(self, id, stage="other", name=None, total=None, project=DEFAULT_PROJECT,
-                 dir=DEFAULT_DIR, every=10.0, note=None, spark=None):
+                 dir=DEFAULT_DIR, every=10.0, note=None, spark=None, slurm_job=None):
         self.dir = os.path.expanduser(dir)
         os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, f"{_safe(project)}--{_safe(id)}.json")
@@ -63,6 +63,7 @@ class ExpStatus:
             "step": 0,
             "metrics": {},
             "note": note,
+            **_slurm(slurm_job),
         }
         self._write()
 
@@ -164,6 +165,19 @@ def _dump(path, data):
     os.replace(tmp, path)
 
 
+def _slurm(job=None):
+    """A Slurm job's id (given, or this process's own) and node, so the pane joins this file to the job.
+
+    Pass the id when reporting a job from outside it, as a sidecar or a check
+    from the login node does: the pane then shows the job once, not twice.
+    """
+    job = job or os.environ.get("SLURM_JOB_ID")
+    if not job:
+        return {}
+    node = os.environ.get("SLURMD_NODENAME")
+    return {"slurmJob": job, **({"host": node} if node else {})}
+
+
 def _safe(id):
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(id))
 
@@ -197,6 +211,7 @@ def main():
     p.add_argument("--step", type=float)
     p.add_argument("--total", type=float)
     p.add_argument("--note")
+    p.add_argument("--slurm-job", metavar="ID", help="the Slurm job this run is, when reporting it from outside the job")
     p.add_argument("--metric", action="append", default=[], help="key=value, repeatable")
     p.add_argument("--clear", metavar="ID", help="delete a run's status file")
     p.add_argument("--dir", default=DEFAULT_DIR)
@@ -236,6 +251,7 @@ def main():
         data["started"] = now
     if data["status"] in ("done", "failed", "killed"):
         data["finished"] = now
+    data.update(_slurm(a.slurm_job))
     data["updated"] = now
     _dump(path, data)
 

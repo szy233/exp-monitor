@@ -9,10 +9,15 @@ asking Claude for a status every time:
   pipeline, every running job with a progress bar, a time-left estimate and a metric trend, and one
   row of counts for finished, failed, lost and queued jobs. Other projects take one line each; closed
   or quiet ones fold away.
-- **Servers tab** — each machine's CPU load and free memory, and per GPU its load, memory and who is
-  using it.
+- **Servers tab** — every machine any of your projects uses, each with its CPU load and free memory
+  and per GPU its load, memory and who is using it. A **Slurm cluster** is drawn the same way: its
+  GPUs are the ones your running jobs hold, each with its real load, memory, job and the time left
+  before the job's limit; idle GPUs and jobs near their limit are flagged.
 - **A row above the prompt** with the session's project progress and a button that opens the pane.
 - **Notifications** when a job finishes or fails.
+- **Instant start**: every session shares the last refresh, so a new session shows it at once, its
+  own project first and open, and refreshes in the background only when it is older than five
+  minutes.
 
 The pane's own text is in Chinese.
 
@@ -24,6 +29,8 @@ The pane's own text is in Chinese.
   (keys, `~/.ssh/config` aliases). Usually the machine you open Claude Code sessions on.
 - **Python 3** on every server that runs jobs (the reporter uses the standard library only).
 - `nvidia-smi` on GPU servers, for the Servers tab (optional).
+- For a **Slurm cluster** (optional): password-less ssh from the hub to its login node; `squeue`,
+  `sinfo`, `sacct` there, and `srun --overlap` (Slurm 20.11+) to read your jobs' GPU load.
 
 ## Installation
 
@@ -58,6 +65,7 @@ Open `/config` in a session (or the plugin's settings in the desktop app) and se
 | --- | --- |
 | `hub` | Leave **empty** if your sessions run on the hub. Otherwise the ssh alias of the hub as this machine sees it. |
 | `workers` | Comma-separated ssh aliases of the servers that run jobs, **as the hub sees them**. `local` means the hub itself. Example: `local,gpu-a,me@gpu-b` |
+| `clusters` | Comma-separated ssh aliases of **Slurm login nodes**, as the hub sees them. Leave empty if you have none. |
 
 Check that each one works without a password, from the hub:
 
@@ -65,7 +73,9 @@ Check that each one works without a password, from the hub:
 ssh -o BatchMode=yes gpu-a true && echo ok
 ```
 
-A project can override `hub` and `workers` in its own `.claude/exp-monitor.json` (step 4 writes it).
+Each project also lists its machines in its own `.claude/exp-monitor.json` (step 4 writes it). Every
+session reads the machines of **all** projects plus these options, so the Servers tab and the job
+list are the same wherever you open the pane.
 
 ### 3. Install the reporter and the skill
 
@@ -85,6 +95,8 @@ Then copy the reporter to every worker (replace the aliases with yours):
 ```bash
 for h in gpu-a me@gpu-b; do ssh "$h" mkdir -p .exp_status && scp exp-monitor/helper/exp_status.py "$h":.exp_status/; done
 ```
+
+On a cluster, copy it once to the login node's home: the compute nodes share it.
 
 ### 4. Initialize a project
 
@@ -127,6 +139,18 @@ $R --stage gate --status running --total 1 && ./eval.sh && $R --status done || $
 
 Once the skill is installed, Claude adds this to the jobs it starts.
 
+**On a Slurm cluster** every job of yours shows up without any of this: the pane reads `squeue` and
+`sacct` and places each job in the project whose name appears in its working directory (submit from
+the project's folder). Inside a job the reporter records `$SLURM_JOB_ID` itself, so the job's
+progress and its scheduler facts show as one run. To report a job from outside it (a sidecar that
+reads its log), pass the id so it is not shown twice:
+
+```bash
+python3 ~/.exp_status/exp_status.py --project tta --id gate-s0 --slurm-job 123456 --step 36000 --total 50000
+```
+
+A run with no step shows 进度未上报 ("progress not reported") and gets no time-left estimate.
+
 ### 6. Check that it works
 
 - Run `/exp` to open the pane and refresh now, or `/exp-status` for a text summary in the chat.
@@ -147,8 +171,11 @@ Once the skill is installed, Claude adds this to the jobs it starts.
 - Close a finished project so it folds away:
   `python3 ~/.exp_status/exp_status.py --project tta --project-status done` (or `failed`, `paused`;
   `active` reopens it).
-- The "doing now / next" lines are written by the `haiku` model when a project's git log or newest
-  notes change, and count toward your Claude usage. Turn them off with the `digests` option.
+- The "doing now / next" lines are written by the `haiku` model when a project's git log, newest
+  notes or set of running jobs change (at most hourly), and count toward your Claude usage. Turn
+  them off with the `digests` option.
+- On a cluster row, 时限剩 is the time before the job's limit (amber under 12 hours: save a
+  checkpoint or resubmit), and 空转 marks a GPU your job holds at under 5% load.
 
 ### Commands
 
@@ -164,6 +191,7 @@ Once the skill is installed, Claude adds this to the jobs it starts.
 | --- | --- | --- |
 | `hub` | *(empty)* | ssh alias of the hub from this machine; empty means this machine is the hub |
 | `workers` | `local` | comma-separated aliases reachable from the hub; `local` is the hub itself |
+| `clusters` | *(empty)* | comma-separated Slurm login-node aliases reachable from the hub |
 | `statusDir` | `~/.exp_status` | where status files live on each server |
 | `intervalSec` | `1800` | seconds between refreshes |
 | `staleMin` | `60` | minutes without an update before a running job is stalled |
@@ -185,10 +213,11 @@ when they change. To remove the plugin: `claude plugin uninstall exp-monitor@exp
 ## How it works
 
 Every refresh, the plugin sends one shell script to the hub (over ssh, or locally when `hub` is
-empty). The hub reads every worker in parallel — each `~/.exp_status/*.json`, load, memory and
-`nvidia-smi` — plus the latest git commits or notes of each project whose
-`.claude/exp-monitor.json` lies under `projectRoots`. Aliases that reach the same machine are read
-once. Nothing is installed on the workers beyond the reporter file.
+empty). The hub reads every worker and cluster in parallel — each `~/.exp_status/*.json`, load,
+memory and `nvidia-smi`; on a cluster, `sinfo`, `squeue`, `sacct` and, through
+`srun --overlap`, each running job's GPUs — plus the machines and the latest git commits or notes of
+each project whose `.claude/exp-monitor.json` lies under `projectRoots`. Aliases that reach the same
+machine are read once. Nothing is installed on the workers beyond the reporter file.
 
 ## License
 

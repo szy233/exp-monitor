@@ -25,6 +25,56 @@ export type Run = {
   /** Steps per second the pane estimates, and from what. */
   estRate?: number
   estFrom?: 'trend' | 'job' | 'average'
+  /** The Slurm job behind the run, on a cluster. */
+  slurm?: SlurmJob
+}
+
+/** One of the person's jobs on a Slurm cluster, as squeue or sacct tells it. */
+export type SlurmJob = {
+  id: string
+  name: string
+  /** Slurm's own state: RUNNING, PENDING, COMPLETED, FAILED, TIMEOUT, ... */
+  state: string
+  /** Seconds run so far, and the time limit (undefined when unlimited). */
+  elapsed: number
+  limit?: number
+  node?: string
+  /** Why a pending job waits (Priority, Resources, ...). */
+  reason?: string
+  partition?: string
+  gpus: number
+  /** When it started, or for a pending job when Slurm expects it to. */
+  start?: number
+  end?: number
+  workdir?: string
+  exit?: string
+  /** Each of a running job's GPUs as the job itself sees it: load in %, memory in MiB. */
+  usage?: { util: number; memUsed: number; memTotal: number }[]
+}
+
+export type SlurmNode = {
+  name: string
+  partition: string
+  state: string
+  gpus: number
+  gpusUsed: number
+  cpus: number
+  cpusUsed: number
+  memTotal: number
+  memAlloc: number
+}
+
+export type SlurmPartition = { name: string; isUp: boolean; limit?: number; allocated: number; idle: number; other: number; total: number }
+
+export type ClusterState = {
+  name?: string
+  running: number
+  pending: number
+  fairShare?: number
+  nodes: SlurmNode[]
+  partitions: SlurmPartition[]
+  mine: SlurmJob[]
+  recent: SlurmJob[]
 }
 
 export type StageStatus = 'todo' | 'active' | 'done' | 'failed' | 'skipped'
@@ -65,6 +115,8 @@ export type HostState = {
   gpus?: Gpu[]
   /** Other worker aliases that reach the same machine. */
   aliases?: string[]
+  /** Set for a Slurm cluster's login node: the scheduler's view instead of one machine's. */
+  cluster?: ClusterState
 }
 
 /** What the model made of a project's recent records. */
@@ -102,6 +154,7 @@ export type ProjectConfig = {
   title?: string
   hub?: string
   workers?: string[]
+  clusters?: string[]
   statusDir?: string
   skip?: boolean
 }

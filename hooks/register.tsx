@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Digest, HostState, ProjectConfig, Run, RunStatus, Setup, Snapshot, View } from '../types'
+import type { ClusterState, Digest, HostState, ProjectConfig, Run, RunStatus, Setup, Snapshot, View } from '../types'
 import {
+  type Fleet,
   type History,
   type Notes,
   type Options,
@@ -28,7 +29,9 @@ import {
   span,
   summary,
   windowSteps,
+  withFleet,
 } from './data'
+import { clusterRuns, slurmStatus } from './slurm'
 import { HUE, bar as svgBar, gpus as svgGpus, pills, ring, spark, stepper } from './svg'
 
 export { span } from './data'
@@ -86,12 +89,41 @@ let digesting: Promise<void> | undefined
 const tried = new Map<string, { sig: string; at: number }>()
 let previous: Map<string, RunStatus> | undefined
 
-// The project's own file wins over the plugin's settings, field by field.
+// The project's own file may name another hub or status folder. Its machines
+// do not narrow the view: every session reads every project's (withFleet).
 function effective(opts: Options, config: ProjectConfig): Options {
-  const own = Object.fromEntries(
-    Object.entries({ hub: config.hub, workers: config.workers, statusDir: config.statusDir }).filter(([, v]) => v !== undefined),
-  )
+  const own = Object.fromEntries(Object.entries({ hub: config.hub, statusDir: config.statusDir }).filter(([, v]) => v !== undefined))
   return readOptions({ ...opts, ...own })
+}
+
+// The views drawn from one snapshot, computed once however often it is drawn.
+let memo: { key: string; views: ProjectView[] } | undefined
+function viewsOf(snap: Snapshot, opts: Options): ProjectView[] {
+  const key = [
+    snap.fetchedAt,
+    snap.runs.length,
+    snap.plans.length,
+    Object.values(snap.digests)
+      .map(one => one.sig)
+      .join(','),
+    opts.lostHours,
+  ].join('|')
+  if (memo?.key !== key) memo = { key, views: projects(snap, opts) }
+  return memo.views
+}
+
+const isSnapshot = (value: unknown): value is Snapshot =>
+  typeof value === 'object' && value !== null && Array.isArray((value as Snapshot).runs) && typeof (value as Snapshot).fetchedAt === 'number'
+
+// Every session shares the last fetch: a new one draws it at once and only
+// fetches again when it is more than five minutes old.
+async function restore($: EngineInterface): Promise<number> {
+  const had = await read($, snapshot)
+  if (had.fetchedAt) return had.fetchedAt
+  const kept = await $.store.get('snapshot')
+  if (!isSnapshot(kept)) return 0
+  await update($, snapshot, (): Snapshot => ({ ...kept, digests: kept.digests ?? {}, isFetching: false }))
+  return kept.fetchedAt
 }
 
 async function loadSetup($: EngineInterface, cwd: string): Promise<Setup> {
@@ -141,7 +173,7 @@ async function showUp($: EngineInterface, opts: Options, cwd: string) {
   void $.ui.open({ id: PANE, title: TITLE })
   const now = await loadSetup($, cwd)
   if (opts.autoInit && now.state === 'missing' && (await isProjectDir($, cwd))) await startInit($, cwd)
-  void refresh($, opts)
+  if (Date.now() / 1000 - (await restore($)) > 300) void refresh($, opts)
 }
 
 async function watchSetup($: EngineInterface, opts: Options) {
@@ -180,26 +212,48 @@ function refresh($: EngineInterface, base: Options): Promise<void> {
   return fetching
 }
 
-async function fetchAll($: EngineInterface, base: Options) {
+const sameFleet = (a: Fleet, b: Fleet) =>
+  a.workers.join(' ') === b.workers.join(' ') && a.clusters.join(' ') === b.clusters.join(' ')
+
+async function fetchAll($: EngineInterface, base: Options, isAgain = false) {
   const had = await read($, setup)
   if (had.cwd) await loadSetup($, had.cwd)
   const { state, config } = await read($, setup)
   // Outside an initialized project nothing is fetched until the person asks.
   if (state !== 'ready' && !isWatching) return
-  const opts = effective(base, config)
+  const known = ((await $.store.get('fleet')) ?? { workers: [], clusters: [] }) as Fleet
+  const opts = withFleet(effective(base, config), known)
   await update($, snapshot, snap => ({ ...snap, isFetching: true }))
   try {
     const ran = await $.process.run(onHub(opts), { stdin: hubScript(opts), timeoutMs: 90_000 })
     const parsed = parse(ran.stdout)
+    // The projects name their machines; one this fetch did not read is read
+    // straight away, once, and every later fetch reads it too.
+    const fleet: Fleet = { workers: [...new Set(parsed.fleet.workers)].sort(), clusters: [...new Set(parsed.fleet.clusters)].sort() }
+    if (!sameFleet(fleet, known)) {
+      await $.store.set('fleet', fleet)
+      const wider = withFleet(effective(base, config), fleet)
+      const isMissing = [...wider.workers, ...wider.clusters].some(host => ![...opts.workers, ...opts.clusters].includes(host))
+      if (isMissing && !isAgain) return await fetchAll($, base, true)
+    }
     const merged = mergeHosts(parsed.hosts, parsed.runs)
     const dismissed = ((await $.store.get('dismissed')) ?? {}) as Dismissed
-    const shown = merged.runs.filter(run => !run.file || dismissed[fileKey(run.where, run.file)] !== runMark(run))
-    const plans = parsed.plans.filter(plan => !plan.file || dismissed[fileKey(plan.where, plan.file)] !== `plan|${plan.updated}`)
     const at = Math.floor(Date.now() / 1000)
+    // Cluster jobs join the runs: the scheduler's facts on the ones that
+    // report, runs of their own for the ones that do not.
+    const withJobs = clusterRuns(
+      merged.runs,
+      parsed.plans,
+      merged.hosts.flatMap(host => (host.cluster ? [{ where: host.host, cluster: host.cluster }] : [])),
+      parsed.notes,
+      at,
+    )
+    const shown = withJobs.runs.filter(run => dismissed[fileKey(run.where, run.file ?? run.id)] !== runMark(run))
+    const plans = withJobs.plans.filter(plan => !plan.file || dismissed[fileKey(plan.where, plan.file)] !== `plan|${plan.updated}`)
     const { runs, history } = estimate(shown, ((await $.store.get('history')) ?? {}) as History, at)
     await $.store.set('history', history)
     const failure = merged.hosts.length === 0 ? (ran.stderr.trim() || `退出码 ${ran.exitCode}`).slice(0, 200) : undefined
-    await update($, snapshot, snap => ({
+    const next = await update($, snapshot, snap => ({
       runs,
       plans,
       hosts: merged.hosts,
@@ -208,6 +262,7 @@ async function fetchAll($: EngineInterface, base: Options) {
       isFetching: false,
       error: failure,
     }))
+    if (!failure) await $.store.set('snapshot', next)
     announce($, runs)
     digesting ??= digestAll($, opts, parsed.notes).finally(() => (digesting = undefined))
   } catch (error) {
@@ -218,28 +273,35 @@ async function fetchAll($: EngineInterface, base: Options) {
 // A project's two lines come from its latest records, asked of the model only
 // when those records changed; every session reuses the answer.
 async function digestAll($: EngineInterface, opts: Options, notes: Notes[]) {
+  const views = viewsOf(await read($, snapshot), opts)
+  const found: Record<string, Digest> = {}
   for (const note of notes) {
-      const cached = (await $.store.get(`digest:${note.project}`)) as Digest | undefined
-      let digest = cached?.sig === note.sig ? cached : undefined
-      const last = tried.get(note.project)
-      const isFresh = last?.sig === note.sig && Date.now() - last.at < 3600_000
-      if (!digest && opts.digests && !isFresh) {
-        tried.set(note.project, { sig: note.sig, at: Date.now() })
-        const snap = await read($, snapshot)
-        const one = projects(snap, opts).find(view => view.project === note.project)
-        if (!one) continue
-        const answer = await $.model.complete({
-          model: 'haiku',
-          prompt: digestPrompt(one, note),
-          maxTokens: 400,
-          effort: 'low',
-          timeoutMs: 60_000,
-        })
-        digest = answer.isAnswered ? readDigest(answer.text, note.sig) : undefined
-        if (digest) await $.store.set(`digest:${note.project}`, digest)
-      }
-      const found = digest ?? cached
-      if (found) await update($, snapshot, snap => ({ ...snap, digests: { ...snap.digests, [note.project]: found } }))
+    const one = views.find(view => view.project === note.project)
+    if (!one) continue
+    // The lines describe the records and what runs now: either changing asks again.
+    const sig = `${note.sig}#${one.live.map(run => run.id).sort().join(',')}`
+    const cached = (await $.store.get(`digest:${note.project}`)) as Digest | undefined
+    let digest = cached?.sig === sig ? cached : undefined
+    const last = tried.get(note.project)
+    const isFresh = last?.sig === sig && Date.now() - last.at < 3600_000
+    if (!digest && opts.digests && !isFresh) {
+      tried.set(note.project, { sig, at: Date.now() })
+      const answer = await $.model.complete({
+        model: 'haiku',
+        prompt: digestPrompt(one, note),
+        maxTokens: 400,
+        effort: 'low',
+        timeoutMs: 60_000,
+      })
+      digest = answer.isAnswered ? readDigest(answer.text, sig) : undefined
+      if (digest) await $.store.set(`digest:${note.project}`, digest)
+    }
+    const shown = digest ?? cached
+    if (shown) found[note.project] = shown
+  }
+  if (Object.keys(found).length) {
+    const next = await update($, snapshot, snap => ({ ...snap, digests: { ...snap.digests, ...found } }))
+    await $.store.set('snapshot', next)
   }
 }
 
@@ -251,15 +313,18 @@ async function archive($: EngineInterface, base: Options, runs: Run[], planOf?: 
   const files = runs.flatMap(run => (run.file ? [{ where: run.where, file: run.file }] : []))
   const plan = planOf?.plan
   if (plan?.file) files.push({ where: plan.where, file: plan.file })
+  // A job seen only through the scheduler has no file: clearing it only hides it.
   const script = archiveScript(opts, files)
-  if (!script) return
-  const ran = await $.process.run(onHub(opts), { stdin: script, timeoutMs: 60_000 })
-  if (ran.exitCode !== 0) {
-    void $.ui.toast(`归档失败：${(ran.stderr.trim() || `退出码 ${ran.exitCode}`).slice(0, 80)}`)
-    return
+  if (!script && runs.every(run => run.file)) return
+  if (script) {
+    const ran = await $.process.run(onHub(opts), { stdin: script, timeoutMs: 60_000 })
+    if (ran.exitCode !== 0) {
+      void $.ui.toast(`归档失败：${(ran.stderr.trim() || `退出码 ${ran.exitCode}`).slice(0, 80)}`)
+      return
+    }
   }
   const dismissed = ((await $.store.get('dismissed')) ?? {}) as Dismissed
-  for (const run of runs) if (run.file) dismissed[fileKey(run.where, run.file)] = runMark(run)
+  for (const run of runs) dismissed[fileKey(run.where, run.file ?? run.id)] = runMark(run)
   if (plan?.file) dismissed[fileKey(plan.where, plan.file)] = `plan|${plan.updated}`
   await $.store.set('dismissed', dismissed)
   await update($, snapshot, snap => ({
@@ -268,7 +333,12 @@ async function archive($: EngineInterface, base: Options, runs: Run[], planOf?: 
     plans: plan ? snap.plans.filter(one => one.project !== plan.project) : snap.plans,
   }))
   await update($, view, (one): View => ({ ...one, confirm: undefined, manage: planOf ? undefined : one.manage }))
-  void $.ui.toast(`已归档 ${files.length} 个状态文件（${opts.statusDir}/archive/ 下可找回）`)
+  const hidden = runs.filter(run => !run.file).length
+  void $.ui.toast(
+    files.length
+      ? `已归档 ${files.length} 个状态文件（${opts.statusDir}/archive/ 下可找回）${hidden ? `，另隐藏 ${hidden} 个集群作业` : ''}`
+      : `已隐藏 ${hidden} 个集群作业`,
+  )
 }
 
 // The first fetch after a load is the baseline: only later changes notify.
@@ -295,13 +365,14 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'exp-status', description: '以文字汇总当前实验进度' })
     await $.command.register({ name: 'exp-init', description: '让 cc 为本项目初始化实验监控（阶段设计、服务器检查）' })
     await loadSetup($, e.cwd)
+    await restore($)
     $.clock.every(opts.intervalSec * 1000, () => void refresh($, opts))
     // The project file is cheap to read: a minute after cc writes it the band
     // has its project, with no wait for the next half-hourly fetch.
     $.clock.every(60_000, () => void watchSetup($, opts))
     // A terminal draws from the start; the desktop app attaches a moment later.
     if (e.surface) await showUp($, opts, e.cwd)
-    else void refresh($, opts)
+    else if (Date.now() / 1000 - (await read($, snapshot)).fetchedAt > 300) void refresh($, opts)
 
     return next(e)
   })
@@ -365,7 +436,7 @@ export const register: Register = (on, options) => {
 
     const eff = effective(opts, here.config)
     const snap = await read($, snapshot)
-    const one = projects(snap, eff).find(p => p.project === here.config.project)
+    const one = viewsOf(snap, eff).find(p => p.project === here.config.project)
     const live = one?.live ?? []
     const now = Math.floor(Date.now() / 1000)
     const lefts = live.map(run => leftText(run, now)).filter(text => text.startsWith('剩') || text === '即将完成')
@@ -407,10 +478,11 @@ export const register: Register = (on, options) => {
     const cols = Math.max(20, e.props.bodyColumns ?? 40)
     // A pixel is about a seventh of a cell in the app's panes.
     const px = Math.max(160, cols * 7)
-    const all = projects(snap, eff)
-    const active = all.filter(one => !one.isIdle)
-    const idle = all.filter(one => one.isIdle)
     const mine = here.config.project
+    // The session's own project leads, open; the rest follow by activity.
+    const all = [...viewsOf(snap, eff)].sort((a, b) => Number(b.project === mine) - Number(a.project === mine))
+    const active = all.filter(one => !one.isIdle || one.project === mine)
+    const idle = all.filter(one => one.isIdle && one.project !== mine)
     const open =
       ui.open ??
       (active.some(one => one.project === mine) ? mine : undefined) ??
@@ -480,22 +552,30 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    // Where a run is: a cluster job by its node, as a run elsewhere is by its machine.
+    const placeOf = (run: Run) => run.slurm?.node ?? hostOf(run)
+    const dateOf = (sec: number) => {
+      const d = new Date(sec * 1000)
+      return `${d.getMonth() + 1}-${d.getDate()} ${clock(sec)}`
+    }
+
     const runRow = (run: Run) => {
       const stale = isStale(run, snap.fetchedAt, eff)
       const ratio = runRatio(run) ?? 0
       const hue = stale ? HUE.stale : HUE.running
       const trend = Svg && run.spark ? spark(run.spark, 52, 14, hue) : undefined
+      const hasSteps = Boolean(run.total && run.step !== undefined)
       const hint = stale ? `停滞 ${span(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}` : leftText(run, now)
       return (
         <Box key={`run-${runKey(run)}`} flexDirection="column">
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Box flexShrink={1}>
               <Text wrap="truncate">
-                {run.name} <Text dimColor>{hostOf(run)}</Text>
+                {run.name} <Text dimColor>{placeOf(run)}</Text>
               </Text>
             </Box>
             <Text>
-              {run.total && run.step !== undefined ? <Text bold>{pct(ratio)}</Text> : ''}
+              {hasSteps ? <Text bold>{pct(ratio)}</Text> : ''}
               {hint && (
                 <Text color={stale ? 'warning' : undefined} dimColor={!stale}>
                   {'  '}
@@ -504,7 +584,7 @@ export const register: Register = (on, options) => {
               )}
             </Text>
           </Box>
-          {run.total && run.step !== undefined ? (
+          {hasSteps ? (
             <Box flexDirection="row" gap={1} alignItems="center">
               {bar(ratio, trend ? px - 60 : px, hue, stale ? 'warning' : 'suggestion')}
               {Svg && trend && <Svg source={trend} alt={`${run.sparkName ?? ''} 走势`} width={52} height={14} />}
@@ -523,10 +603,11 @@ export const register: Register = (on, options) => {
       const took = run.started !== undefined ? (run.finished ?? run.updated ?? run.started) - run.started : undefined
       const first = Object.entries(run.metrics ?? {})[0]
       const result = first ? `${first[0]} ${typeof first[1] === 'number' ? Number(first[1].toPrecision(4)) : first[1]}` : ''
+      const job = run.slurm
       const when = lost
         ? `失联 ${span(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}`
         : run.status === 'queued'
-          ? '排队中'
+          ? ['排队中', job?.reason, job?.start ? `预计 ${dateOf(job.start)}` : ''].filter(Boolean).join(' · ')
           : took !== undefined && took > 0
             ? `用时 ${span(took)}`
             : ''
@@ -549,7 +630,7 @@ export const register: Register = (on, options) => {
           </Box>
           <Text dimColor wrap="truncate">
             {'  '}
-            {[stage, hostOf(run), when].filter(Boolean).join(' · ')}
+            {[stage, placeOf(run), when].filter(Boolean).join(' · ')}
           </Text>
           {run.note && (run.status === 'failed' || run.status === 'killed') && (
             <Text color="error" wrap="truncate">
@@ -590,7 +671,9 @@ export const register: Register = (on, options) => {
       return (
         <Box key={`card-${one.project}`} flexDirection="column" gap={1}>
           <Box flexDirection="row" gap={1} alignItems="center">
-            {Svg && <Svg source={ring(one.ratio, 34, HUE.accent)} alt={`总进度 ${pct(one.ratio)}`} width={34} height={34} />}
+            {Svg && one.stages.length > 0 && (
+              <Svg source={ring(one.ratio, 34, HUE.accent)} alt={`总进度 ${pct(one.ratio)}`} width={34} height={34} />
+            )}
             <Box flexDirection="column" flexGrow={1} flexShrink={1}>
               <Text bold wrap="truncate">
                 {one.title}
@@ -606,7 +689,7 @@ export const register: Register = (on, options) => {
               <Text dimColor>▴</Text>
             </Button>
           </Box>
-          {Svg ? (
+          {one.stages.length === 0 ? null : Svg ? (
             <Svg
               source={stepper(windowSteps(one, room), px)}
               alt={one.stages.map(stage => `${stage.status === 'done' ? '✔' : stage.id === one.current?.id ? '●' : '○'}${stage.title}`).join(' ')}
@@ -740,55 +823,143 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    // One way of drawing GPUs, for a machine's own and a cluster's jobs' alike.
+    type GpuRow = { label: string; util: number; memUsed: number; memTotal: number; note: string; warn?: boolean }
+    const gpuRows = (rows: GpuRow[]) => {
+      const drawn = Svg ? svgGpus(rows, px) : undefined
+      return Svg && drawn ? (
+        <Svg
+          source={drawn.source}
+          alt={rows.map(row => `${row.label} ${row.util}% ${gb(row.memUsed)}/${gb(row.memTotal)} ${row.note}`).join('；')}
+          width={px}
+          height={drawn.height}
+        />
+      ) : (
+        rows.map(row => (
+          <Text wrap="truncate">
+            <Text dimColor>{row.label} </Text>
+            <Text color={row.util >= 60 ? 'suggestion' : 'subtle'}>{lineBar(row.util / 100, 8)[0]}</Text>
+            <Text dimColor>{lineBar(row.util / 100, 8)[1]}</Text> {row.util}%
+            <Text dimColor={!row.warn} color={row.warn ? 'warning' : undefined}>
+              {' '}
+              {gb(row.memUsed)}/{gb(row.memTotal)} · {row.note}
+            </Text>
+          </Text>
+        ))
+      )
+    }
+
+    const hostHead = (name: string, aliases: string, isOk: boolean, right: string) => (
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box flexShrink={1}>
+          <Text wrap="truncate">
+            <Text color={isOk ? 'success' : 'warning'}>●</Text> <Text bold>{name}</Text>
+            <Text dimColor> {aliases}</Text>
+          </Text>
+        </Box>
+        <Text dimColor>{right}</Text>
+      </Box>
+    )
+
+    // A Slurm cluster drawn as a machine: its GPUs are the ones the person's
+    // running jobs hold, each with what it does and the time its job has left.
+    const clusterCard = (host: HostState, c: ClusterState) => {
+      const gpuTotal = c.nodes.reduce((n, node) => n + node.gpus, 0)
+      const gpuUsed = c.nodes.reduce((n, node) => n + node.gpusUsed, 0)
+      const cpus = c.nodes.reduce((n, node) => n + node.cpus, 0)
+      const cpusUsed = c.nodes.reduce((n, node) => n + node.cpusUsed, 0)
+      const running = c.mine.filter(job => slurmStatus(job.state) === 'running')
+      const pending = c.mine.filter(job => slurmStatus(job.state) === 'queued')
+      const mineGpus = running.reduce((n, job) => n + job.gpus, 0)
+      const rows: GpuRow[] = []
+      const cpuJobs: { name: string; node?: string; note: string; warn: boolean }[] = []
+      for (const job of running) {
+        const left = job.limit !== undefined ? job.limit - job.elapsed - (now - snap.fetchedAt) : undefined
+        const isSoon = left !== undefined && left < 12 * 3600
+        const limit = left === undefined ? '无时限' : `时限剩 ${span(Math.max(0, left))}`
+        const usage = job.usage?.length ? job.usage : Array.from({ length: job.gpus }, () => undefined)
+        if (usage.length === 0) {
+          cpuJobs.push({ name: job.name, node: job.node, note: limit, warn: isSoon })
+          continue
+        }
+        for (const gpu of usage) {
+          const isIdle = gpu !== undefined && gpu.util < 5
+          rows.push({
+            label: job.node ?? '?',
+            util: gpu?.util ?? 0,
+            memUsed: gpu?.memUsed ?? 0,
+            memTotal: gpu?.memTotal ?? 0,
+            note: [job.name, limit, isIdle ? '空转' : '', gpu ? '' : '读不到'].filter(Boolean).join(' · '),
+            warn: isSoon || isIdle,
+          })
+        }
+      }
+      const right = [
+        cpus ? `CPU ${Math.round((cpusUsed / cpus) * 100)}%` : '',
+        gpuTotal ? `GPU ${gpuUsed}/${gpuTotal} 已分配` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ')
+      const rest = gpuTotal
+        ? `其余 ${Math.max(0, gpuUsed - mineGpus)} 卡被他人占用 · ${gpuTotal - gpuUsed} 卡空闲 · 排队 ${c.pending}`
+        : `全部 ${c.running} 运行 · ${c.pending} 排队`
+      return (
+        <Box key={`cluster-${host.host}`} flexDirection="column">
+          {hostHead(c.name ?? host.host, host.host, true, right)}
+          {rows.length > 0 && gpuRows(rows)}
+          {cpuJobs.map(job => (
+            <Text wrap="truncate" dimColor={!job.warn} color={job.warn ? 'warning' : undefined}>
+              {job.name}
+              {job.node ? ` · ${job.node}` : ''} · {job.note}
+            </Text>
+          ))}
+          {pending.length > 0 && (
+            <Text dimColor wrap="truncate">
+              排队 {pending.length}：
+              {pending.map(job => `${job.name}（${[job.reason, job.start ? `预计 ${dateOf(job.start)}` : ''].filter(Boolean).join(' · ')}）`).join('、')}
+              {c.fairShare !== undefined ? ` · 公平份额 ${c.fairShare.toFixed(3)}` : ''}
+            </Text>
+          )}
+          <Text dimColor wrap="truncate">
+            {rest}
+          </Text>
+        </Box>
+      )
+    }
+
+    const hasRows = snap.hosts.some(host => (host.gpus?.length ?? 0) > 0 || host.cluster?.mine.some(job => job.gpus > 0))
     const servers = (
       <Box flexDirection="column" gap={1}>
         {snap.hosts.length === 0 && <Text dimColor>还没有服务器信息，按 ⟳ 同步。</Text>}
         {snap.hosts.map(host => {
+          if (host.cluster) return clusterCard(host, host.cluster)
           const load = host.load !== undefined && host.cpus ? `CPU ${Math.round((host.load / host.cpus) * 100)}%` : ''
           const mem = host.memAvail !== undefined ? `${gb(host.memAvail)} 内存空闲` : ''
           const list = host.gpus ?? []
+          const aliases = [host.host, ...(host.aliases ?? [])].filter(name => name !== host.hostname).join(' / ')
           return (
             <Box key={`host-${host.host}`} flexDirection="column">
-              <Box flexDirection="row" justifyContent="space-between" gap={1}>
-                <Box flexShrink={1}>
-                  <Text wrap="truncate">
-                    <Text color={host.isOk ? 'success' : 'warning'}>●</Text> <Text bold>{host.hostname ?? host.host}</Text>
-                    <Text dimColor> {[host.host, ...(host.aliases ?? [])].filter(name => name !== host.hostname).join(' / ')}</Text>
-                  </Text>
-                </Box>
-                <Text dimColor>{[load, mem].filter(Boolean).join(' · ')}</Text>
-              </Box>
+              {hostHead(host.hostname ?? host.host, aliases, host.isOk, [load, mem].filter(Boolean).join(' · '))}
               {!host.isOk && (
                 <Text color="warning" wrap="truncate">
                   连不上：{host.error}
                 </Text>
               )}
               {list.length > 0 &&
-                (Svg ? (
-                  <Svg
-                    source={svgGpus(list, px).source}
-                    alt={list.map(gpu => `GPU${gpu.index} ${gpu.util}% ${gb(gpu.memUsed)}/${gb(gpu.memTotal)} ${gpu.users.join(',') || '空闲'}`).join('；')}
-                    width={px}
-                    height={svgGpus(list, px).height}
-                  />
-                ) : (
-                  list.map(gpu => (
-                    <Text wrap="truncate">
-                      <Text dimColor>{gpu.index} </Text>
-                      <Text color={gpu.util >= 60 ? 'suggestion' : 'subtle'}>{lineBar(gpu.util / 100, 8)[0]}</Text>
-                      <Text dimColor>{lineBar(gpu.util / 100, 8)[1]}</Text> {gpu.util}%
-                      <Text dimColor>
-                        {' '}
-                        {gb(gpu.memUsed)}/{gb(gpu.memTotal)} · {gpu.users.join(',') || '空闲'}
-                      </Text>
-                    </Text>
-                  ))
-                ))}
+                gpuRows(
+                  list.map(gpu => ({
+                    label: String(gpu.index),
+                    util: gpu.util,
+                    memUsed: gpu.memUsed,
+                    memTotal: gpu.memTotal,
+                    note: gpu.users.join(',') || '空闲',
+                  })),
+                )}
               {host.isOk && list.length === 0 && <Text dimColor>没有 GPU 或读不到 nvidia-smi</Text>}
             </Box>
           )
         })}
-        {gpuCount > 0 && <Text dimColor>每行：卡号 · 利用率 · 显存 · 占用者</Text>}
+        {hasRows && <Text dimColor>每行：卡号或节点 · 利用率 · 显存 · 占用者或作业</Text>}
       </Box>
     )
 

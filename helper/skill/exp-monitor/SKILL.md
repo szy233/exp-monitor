@@ -5,8 +5,8 @@ description: Design a research project's experiment stages from its storyline an
 
 # exp-monitor: stages and progress for the monitor pane
 
-A pane on the person's client reads `~/.exp_status/*.json` on every server over ssh, every half
-hour by default. Two kinds of files live there, written atomically by `~/.exp_status/exp_status.py`
+A pane on the person's client reads `~/.exp_status/*.json` on every server over ssh every
+minute. Two kinds of files live there, written atomically by `~/.exp_status/exp_status.py`
 (copy it to each server if it is missing; standard library only):
 
 - `<project>.plan.json`: the project's stages, written by you. One per project, on the hub.
@@ -101,3 +101,35 @@ when a step count exists; a batch of N jobs reports `total: N` and `step` as how
   project's latest git commits (or, outside git, the tail of its newest `research/*.md` / `*.md`
   note such as LEDGER.md). Commit messages and ledger entries that name the experiment and its
   verdict (`GATE-1: receipt; P1 met on 3 seeds`, `rule on FULL-1 (pass)`) are what make those lines right.
+
+## 4. Jobs on a Slurm cluster
+
+A cluster's login node listed in the pane's `clusters` option is read through the scheduler:
+`squeue`/`sacct` for the person's jobs, `sinfo` for nodes and GPUs. Every job shows up even
+without reporting: placed in the project whose name (or folder name) appears in the job's
+working directory, measured by elapsed time against its time limit. To give it real progress
+and a time-left estimate, make the job report as in section 2, with the reporter copied to
+`~/.exp_status/` in the cluster's home (shared by all its nodes):
+
+```bash
+#!/bin/bash
+#SBATCH -J gate-s0 -p <partition> --gres=gpu:1 -t 2-00:00:00
+cd ~/research/<project>          # submit from the project folder so the pane can place it
+python3 train.py                 # with ExpStatus(...) inside: it records $SLURM_JOB_ID itself
+```
+
+Submit from inside the project's folder (or name jobs after its id) so the pane can tell which
+project a job belongs to; jobs it cannot place are grouped as the cluster's 未归类作业.
+
+A job you cannot change (already running, or a script that does not report) can still show
+progress: report it from outside, from the hub or a sidecar, with its Slurm id so the pane
+shows it once and not as two runs, and refresh the step every time you look at its log:
+
+```bash
+R="python3 ~/.exp_status/exp_status.py --project tta --id gate-s0 --slurm-job 123456"
+$R --stage step --status running --total 50000 --step 36000   # then again with the new step each check
+```
+
+A run registered without a step shows 进度未上报 in the pane and gets no time-left estimate. A
+batch of N items reports `--total N` and `--step` as how many are finished, updated as they
+finish.

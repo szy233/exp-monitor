@@ -46,6 +46,9 @@ function workerScript(dir: string) {
   return [
     `for f in ${dir}/*.json; do [ -f "$f" ] && { echo "@@FILE $f"; cat "$f"; echo; }; done`,
     `echo "@@SYS $(hostname) $(nproc) $(cut -d' ' -f1 /proc/loadavg) $(free -m | awk '/^Mem:/{print $2, $7}')"`,
+    // CPU in use: busy and idle jiffies read twice, half a second apart.
+    // Printed as integers: awk's default %.6g would round the counters away.
+    `c1=$(awk '/^cpu /{printf "%.0f %.0f", $2+$3+$4+$7+$8+$9, $5+$6}' /proc/stat); sleep 0.5; c2=$(awk '/^cpu /{printf "%.0f %.0f", $2+$3+$4+$7+$8+$9, $5+$6}' /proc/stat); echo "@@CPU $c1 $c2"`,
     'if command -v nvidia-smi >/dev/null 2>&1; then',
     '  echo @@GPU; nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits',
     '  echo @@APPS; nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits | while IFS=", " read u p m; do echo "$u,$m,$(ps -o user= -p "$p" 2>/dev/null)"; done',
@@ -294,6 +297,11 @@ export function parse(stdout: string): Parsed {
       host.load = Number(load)
       host.memTotal = Number(memTotal) || undefined
       host.memAvail = Number(memAvail) || undefined
+    } else if (text.startsWith('@@CPU ') && host) {
+      const [b1, i1, b2, i2] = text.slice(6).trim().split(/\s+/).map(Number)
+      const busy = (b2 ?? 0) - (b1 ?? 0)
+      const all = busy + ((i2 ?? 0) - (i1 ?? 0))
+      if (all > 0) host.cpuPct = Math.round((busy / all) * 100)
     } else if (text === '@@GPU' && host) {
       section = 'gpu'
       host.gpus = []
@@ -343,6 +351,18 @@ export const span = (sec: number) => {
   return `~${Math.round(s / 43200) / 2}d`
 }
 export const pct = (ratio: number) => `${Math.round(ratio * 100)}%`
+
+/**
+ * A name without the notes people put in brackets: `GATE s0 (node 3, resumed)`
+ * reads `GATE s0`, a title `记忆化实验（memo-v2）` reads `记忆化实验`.
+ */
+export function shortName(text: string): string {
+  const bare = text
+    .replace(/\s*[（(【\[][^）)】\]]*[）)】\]]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return bare || text.trim()
+}
 export const clamp = (ratio: number) => Math.min(1, Math.max(0, ratio))
 
 // A terminal draws a thin line: `━━━━━╸────`.
@@ -483,7 +503,7 @@ export function projects(snap: Snapshot, opts: Options): ProjectView[] {
     const lastActive = Math.max(0, plan?.updated ?? 0, ...runs.map(run => run.updated ?? run.started ?? 0))
     views.push({
       project,
-      title: plan?.title ?? project,
+      title: snap.digests[project]?.title ?? shortName(plan?.title ?? project),
       plan,
       stages,
       current,
@@ -553,7 +573,7 @@ export function digestPrompt(view: ProjectView, notes: Notes): string {
     `最近的实验记录（新的在前或在后，按文件原样）：\n${notes.text}`,
     '',
     '为监控面板写极简状态，只输出一个 JSON 对象，不要别的文字：',
-    '{"now": "正在做什么，具体到实验或判定名，≤18 个汉字", "next": "下一步，≤18 个汉字，没有就省略", "short": {"<阶段 id>": "≤6 个汉字或 8 个字符的短名"}}',
+    '{"title": "项目短名，≤8 个汉字或 14 个字符", "now": "正在做什么，具体到实验或判定名，≤16 个汉字", "next": "下一步，≤16 个汉字，没有就省略", "short": {"<阶段 id>": "≤6 个汉字或 8 个字符的短名"}}',
     '用实验记录里最新的事实，不要编造；英文术语保留原样。',
   ].join('\n')
 }
@@ -570,7 +590,7 @@ export function readDigest(text: string, sig: string): Digest | undefined {
       }
     }
     const line = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 40) : undefined)
-    return { sig, now: line(raw.now), next: line(raw.next), short }
+    return { sig, title: line(raw.title)?.slice(0, 16), now: line(raw.now), next: line(raw.next), short }
   } catch {
     return undefined
   }
@@ -593,17 +613,39 @@ export function summary(snap: Snapshot, opts: Options, now: number): string {
     for (const run of view.live) {
       const left = leftText(run, now)
       lines.push(
-        `  - ● ${run.name} @${hostOf(run)}` +
+        `  - ● ${shortName(run.name)} @${hostOf(run)}` +
           (run.total && run.step !== undefined ? ` ${pct(runRatio(run) ?? 0)}` : '') +
           (left ? ` ${left}` : '') +
           (isStale(run, snap.fetchedAt, opts) ? '（停滞）' : ''),
       )
     }
-    for (const run of view.ended.filter(one => one.status === 'failed')) lines.push(`  - ✖ ${run.name}${run.note ? `：${run.note}` : ''}`)
+    for (const run of view.ended.filter(one => one.status === 'failed')) lines.push(`  - ✖ ${shortName(run.name)}${run.note ? `：${shortName(run.note)}` : ''}`)
     if (view.lost.length) lines.push(`  - 失联 ${view.lost.length} 个（超过 ${opts.lostHours} 小时没有更新）`)
   }
   const idle = views.filter(one => one.isIdle).length
   if (idle) lines.push(`- 另有 ${idle} 个闲置项目`)
   for (const host of snap.hosts.filter(one => !one.isOk)) lines.push(`- 无法连接 ${host.host}：${host.error}`)
   return lines.join('\n')
+}
+
+/** The counts across all projects, for the strip on top of the task tab. */
+export type Totals = { running: number; queued: number; doneToday: number; failed: number; lost: number }
+
+export function totals(views: ProjectView[], at: number): Totals {
+  const midnight = (() => {
+    const d = new Date(at * 1000)
+    d.setHours(0, 0, 0, 0)
+    return Math.floor(d.getTime() / 1000)
+  })()
+  const out: Totals = { running: 0, queued: 0, doneToday: 0, failed: 0, lost: 0 }
+  for (const view of views) {
+    out.running += view.live.length
+    out.queued += view.queued.length
+    out.lost += view.lost.length
+    for (const run of view.ended) {
+      if (run.status === 'done' && (run.finished ?? run.updated ?? 0) >= midnight) out.doneToday += 1
+      if (run.status === 'failed') out.failed += 1
+    }
+  }
+  return out
 }

@@ -128,23 +128,27 @@ test('the open project shows its stages, its running run with a trend estimate, 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /TTA 崩塌机理/ }))?.text).toContain('TTA 崩塌机理')
-    // 200 steps in 40 minutes leaves 500 steps: about an hour and a half.
-    expect((await ui.find({ type: 'Text', text: /剩/ }))?.text).toContain('剩 ~1.5h')
+    // One line per run: name, place, bar, %, time. 200 steps in 40 minutes
+    // leaves 500 steps: about an hour and a half.
+    expect((await ui.find({ type: 'Text', text: /^~1\.5h$/ }))?.text).toBe('~1.5h')
+    expect((await ui.find({ type: 'Text', text: /^50%$/ }))?.text).toBe('50%')
     // The run read through two aliases of one machine is drawn once.
-    expect((await ui.findAll({ type: 'Text', text: /^lr3e-4/ })).length).toBe(1)
+    expect((await ui.findAll({ type: 'Text', text: /^lr3e-4$/ })).length).toBe(1)
     // A run silent for 20 hours is lost, not running.
     expect(await ui.find({ type: 'Text', text: /^zombie/ })).toBeUndefined()
     if (surface !== 'terminal') {
       const alts = (await ui.findAll({ type: 'Svg' })).map(svg => svg.props.alt)
+      // The strip on top counts across projects; the project's own row counts its ended runs.
+      expect(alts).toContain('1 运行 · 1 今日完成 · 1 失败 · 1 失联')
       expect(alts).toContain('1 完成 · 1 失败 · 1 失联')
       expect(alts).toContain('✔入口探针 ●Gate 验证 ○全量')
     }
     // The finished project waits folded under the idle group.
-    expect((await ui.find({ type: 'Text', text: /闲置/ }))?.text).toContain('闲置 1 个项目')
-    expect((await ui.find({ type: 'Text', text: /gpu2 连不上/ }))?.text).toContain('gpu2')
+    expect((await ui.find({ type: 'Text', text: /闲置/ }))?.text).toContain('闲置 1')
+    expect((await ui.find({ type: 'Text', text: /连不上/ }))?.text).toContain('1 台机器连不上')
     await ui.press({ key: 'detail-tta' })
-    expect((await ui.find({ type: 'Text', text: /^\s*OOM$/ }))?.text?.trim()).toBe('OOM')
-    expect((await ui.find({ type: 'Text', text: /失联 ~/ }))?.text).toContain('失联 ~')
+    expect((await ui.find({ type: 'Text', text: /^lr1e-3/ }))?.text).toContain('OOM')
+    expect((await ui.find({ type: 'Text', text: /^zombie/ }))?.text).toContain('失联 ~')
     await ui.press({ key: 'detail-tta' })
     await ui.unmount()
   }
@@ -156,7 +160,8 @@ test('the server tab shows each machine once with its GPUs', { options: WORKERS 
   await $.command.run(status(''))
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'tab-srv' })
-  expect((await ui.find({ type: 'Text', text: /box17/ }))?.text).toContain('gpu1 / gpu1b')
+  // box17, reached as gpu1 and gpu1b, is one machine, named by its shortest name.
+  expect((await ui.findAll({ type: 'Text', text: /^● gpu1/ })).map(one => one.text)).toEqual(['● gpu1'])
   const alts = (await ui.findAll({ type: 'Svg' })).map(svg => svg.props.alt)
   expect(alts).toContain('0 100% 9G/80G alice；1 0% 0G/80G 空闲')
   expect((await ui.find({ type: 'Text', text: /连不上/ }))?.text).toContain('Connection refused')
@@ -193,10 +198,11 @@ test('a project summary comes from its latest records, once per change', { optio
   await $.command.run(status(''))
   await $.command.run(status(''))
   // Keyed by the records and the runs that run now: either changing asks again.
-  expect((stored.get('digest:tta') as { sig: string }).sig).toBe('abc123#g1')
+  expect((stored.get('digest:tta') as { sig: string }).sig).toBe('v2|abc123#g1')
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /正在/ }))?.text).toBe('正在 · GATE-A 收尾')
-  expect((await ui.find({ type: 'Text', text: /下一步/ }))?.text).toBe('下一步 · 开 FULL-1')
+  // One line under the title says what runs now; the next step stays out of the way.
+  expect((await ui.find({ type: 'Text', text: /GATE-A/ }))?.text).toBe('GATE-A 收尾')
+  expect(await ui.find({ type: 'Text', text: /下一步/ })).toBeUndefined()
   const alts = (await ui.findAll({ type: 'Svg' })).map(svg => svg.props.alt)
   expect(alts.some(alt => String(alt).includes('✔入口探针'))).toBe(true)
   await ui.unmount()
@@ -448,24 +454,25 @@ test('a cluster is drawn like a machine: its jobs as runs, its GPUs with their l
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     // In the project, a cluster job reads as a run on a machine: its node, its progress.
-    expect((await ui.find({ type: 'Text', text: /^c1/ }))?.text).toBe('c1 gpu1')
-    expect((await ui.find({ type: 'Text', text: /^ev_x/ }))?.text).toBe('ev_x gpu1')
-    expect(await ui.find({ type: 'Text', text: /时限剩/ })).toBeUndefined()
+    // c1 and ev_x on the cluster's node gpu1, and lr3e-4 on the worker of that name.
+    expect((await ui.findAll({ type: 'Text', text: /^gpu1$/ })).length).toBe(3)
+    expect((await ui.find({ type: 'Text', text: /^ev_x$/ }))?.text).toBe('ev_x')
+    expect(await ui.find({ type: 'Text', text: /时限/ })).toBeUndefined()
     await ui.press({ key: 'detail-tta' })
-    expect((await ui.find({ type: 'Text', text: /Priority/ }))?.text).toContain('排队中 · Priority · 预计 11-25 03:00')
-    expect((await ui.find({ type: 'Text', text: /FAILED/ }))?.text?.trim()).toBe('FAILED · exit 1:0')
+    expect((await ui.find({ type: 'Text', text: /Priority/ }))?.text).toContain('排队 · Priority · 预计 11-25 03:00')
+    expect((await ui.find({ type: 'Text', text: /FAILED/ }))?.text).toContain('FAILED · exit 1:0')
     await ui.press({ key: 'detail-tta' })
     await ui.press({ key: 'tab-srv' })
-    expect((await ui.find({ type: 'Text', text: /public_gpu/ }))?.text).toBe('● public_gpu gpuc')
-    expect((await ui.find({ type: 'Text', text: /GPU 3\/16/ }))?.text).toBe('CPU 19% · GPU 3/16 已分配')
-    expect((await ui.find({ type: 'Text', text: /^排队 1/ }))?.text).toBe('排队 1：ev_y（Priority · 预计 11-25 03:00） · 公平份额 0.008')
-    expect((await ui.find({ type: 'Text', text: /其余/ }))?.text).toBe('其余 0 卡被他人占用 · 13 卡空闲 · 排队 2')
+    expect((await ui.find({ type: 'Text', text: /^● gpuc/ }))?.text).toBe('● gpuc Slurm')
+    expect((await ui.find({ type: 'Text', text: /已分配/ }))?.text).toBe('GPU 3/16 已分配 · 你 3 · 空闲 13 · 排队 2（你 1 · Priority）')
     if (surface === 'desktop') {
-      expect((await ui.findAll({ type: 'Svg' })).map(svg => svg.props.alt)).toContain(
-        'gpu1 97% 10G/80G c1 · 时限剩 ~2d；gpu1 0% 14G/80G ev_x · 时限剩 ~23h · 空转；gpu1 3% 0G/80G ev_x · 时限剩 ~23h · 空转',
-      )
+      const alts = (await ui.findAll({ type: 'Svg' })).map(svg => svg.props.alt)
+      expect(alts).toContain('gpu1 97% 10G/80G c1 · 剩 ~2d；gpu1 0% 14G/80G ev_x · 剩 ~23h · 空转；gpu1 3% 0G/80G ev_x · 剩 ~23h · 空转')
+      // The title line's meters: CPU and memory allocated across the cluster.
+      expect(alts).toContain('CPU 19% MEM 0%')
     } else {
-      expect((await ui.find({ type: 'Text', text: /c1 · 时限剩/ }))?.text).toContain('97%')
+      expect((await ui.find({ type: 'Text', text: /c1 · 剩/ }))?.text).toContain('97%')
+      expect((await ui.findAll({ type: 'Text', text: /^CPU/ })).map(one => one.text)).toContain('CPU 19%  MEM 0%')
     }
     await ui.press({ key: 'tab-exp' })
     await ui.unmount()

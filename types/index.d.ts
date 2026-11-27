@@ -113,6 +113,8 @@ export type HostState = {
   memTotal?: number
   memAvail?: number
   gpus?: Gpu[]
+  /** CPU in use, %, measured over half a second. */
+  cpuPct?: number
   /** Other worker aliases that reach the same machine. */
   aliases?: string[]
   /** Set for a Slurm cluster's login node: the scheduler's view instead of one machine's. */
@@ -122,6 +124,7 @@ export type HostState = {
 /** What the model made of a project's recent records. */
 export type Digest = {
   sig: string
+  title?: string
   now?: string
   next?: string
   short?: Record<string, string>

@@ -4,17 +4,20 @@ A [Claude Code](https://claude.com/claude-code) plugin that keeps a pane beside 
 experiments running on several servers. It reads each job's progress over ssh and shows, without you
 asking Claude for a status every time:
 
-- **Experiments tab** — one project open at a time: an overall progress ring, a two-line
-  "doing now / next" summary written from the project's latest git commits or notes, its stages as a
-  pipeline, every running job with a progress bar, a time-left estimate and a metric trend, and one
-  row of counts for finished, failed, lost and queued jobs. Other projects take one line each; closed
-  or quiet ones fold away.
-- **Servers tab** — every machine any of your projects uses, each with its CPU load and free memory
-  and per GPU its load, memory and who is using it. A **Slurm cluster** is drawn the same way: its
+- **Tasks tab** — a strip of totals across all projects (running, queued, finished today, failed,
+  lost), then one project open at a time: an overall progress ring, one "doing now" line written from
+  the project's latest git commits or notes, its stages as a pipeline, and its running jobs as a
+  table, one line each with aligned columns: name, machine, progress bar, %, time left. Names drop
+  the notes people put in brackets and are cut in the middle when long, so `…_s1` and `…_s2` stay
+  apart. Other projects take one line each; closed or quiet ones fold away.
+- **Resources tab** — every machine any of your projects uses, btop-style: its shortest name with CPU
+  (measured from `/proc/stat`) and memory meters on the title line, then per GPU its load, memory and
+  who is using it. A **Slurm cluster** is drawn the same way: its
   GPUs are the ones your running jobs hold, each with its real load, memory, job and the time left
   before the job's limit; idle GPUs and jobs near their limit are flagged.
 - **A row above the prompt** with the session's project progress and a button that opens the pane.
-- **Notifications** when a job finishes or fails.
+- **Notifications** when a job finishes or fails: once, whichever session sees it first, and only
+  for jobs that ended in the last six hours.
 - **Instant start**: every session shares the last refresh, so a new session shows it at once, its
   own project first and open, and refreshes in the background only when it is older than five
   minutes.
@@ -28,7 +31,7 @@ The pane's own text is in Chinese.
 - **A hub**: one machine that can `ssh` to every server that runs jobs **without a password**
   (keys, `~/.ssh/config` aliases). Usually the machine you open Claude Code sessions on.
 - **Python 3** on every server that runs jobs (the reporter uses the standard library only).
-- `nvidia-smi` on GPU servers, for the Servers tab (optional).
+- `nvidia-smi` on GPU servers, for the Resources tab (optional).
 - For a **Slurm cluster** (optional): password-less ssh from the hub to its login node; `squeue`,
   `sinfo`, `sacct` there, and `srun --overlap` (Slurm 20.11+) to read your jobs' GPU load.
 
@@ -74,7 +77,7 @@ ssh -o BatchMode=yes gpu-a true && echo ok
 ```
 
 Each project also lists its machines in its own `.claude/exp-monitor.json` (step 4 writes it). Every
-session reads the machines of **all** projects plus these options, so the Servers tab and the job
+session reads the machines of **all** projects plus these options, so the Resources tab and the job
 list are the same wherever you open the pane.
 
 ### 3. Install the reporter and the skill
@@ -154,7 +157,7 @@ A run with no step shows 进度未上报 ("progress not reported") and gets no t
 ### 6. Check that it works
 
 - Run `/exp` to open the pane and refresh now, or `/exp-status` for a text summary in the chat.
-- The Servers tab should list every worker with its GPUs. A server shown as unreachable fails the
+- The Resources tab should list every worker with its GPUs. A server shown as unreachable fails the
   `ssh -o BatchMode=yes` test from step 2.
 - A job appears within one refresh (every 30 minutes by default; ⟳ or `r` refreshes at once).
 

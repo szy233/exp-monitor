@@ -150,8 +150,8 @@ export function spark(values: number[], width: number, h: number, color: string)
 }
 
 /** Soft tinted pills, one per count: a dot, the count in its color, the label gray. */
-export function pills(items: { count: number; label: string; color: string }[], h = 22) {
-  const size = 12
+export function pills(items: { count: number; label: string; color: string }[], h = 20) {
+  const size = 11.5
   const gap = 6
   let x = 0
   const parts: string[] = []
@@ -206,4 +206,32 @@ export function gpus(
     )
   })
   return { source: svg(width, list.length * row, parts.join('')), height: list.length * row }
+}
+
+/**
+ * Meters side by side, btop-style: a gray label, a short bar and the
+ * percentage. A bar turns amber from 80% and red from 95%.
+ */
+export function meters(items: { label: string; ratio: number }[], barW = 46) {
+  const size = 11
+  const h = 14
+  const gap = 12
+  let x = 0
+  const parts: string[] = []
+  for (const item of items) {
+    const ratio = clamp(item.ratio)
+    const fill = ratio >= 0.95 ? HUE.failed : ratio >= 0.8 ? HUE.stale : HUE.running
+    // Latin capitals run wider than the half-em textWidth allows for.
+    const labelW = [...item.label].length * size * 0.72 + 5
+    const value = `${Math.round(ratio * 100)}%`
+    parts.push(
+      `<text x="${x}" y="${h / 2}" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${HUE.label}">${esc(item.label)}</text>`,
+      `<rect x="${x + labelW}" y="${h / 2 - 3}" width="${barW}" height="6" rx="3" fill="${HUE.track}"/>`,
+      ratio > 0 ? `<rect x="${x + labelW}" y="${h / 2 - 3}" width="${Math.max(6, ratio * barW).toFixed(1)}" height="6" rx="3" fill="${fill}"/>` : '',
+      `<text x="${x + labelW + barW + 4}" y="${h / 2}" dominant-baseline="central" font-family="${FONT}" font-size="${size}" fill="${HUE.label}">${value}</text>`,
+    )
+    x += labelW + barW + 4 + textWidth('100%', size) + gap
+  }
+  const width = Math.ceil(x - gap)
+  return { source: svg(width, h, parts.join('')), width, height: h }
 }

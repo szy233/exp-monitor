@@ -26,13 +26,15 @@ import {
   readOptions,
   runKey,
   runRatio,
+  shortName,
   span,
   summary,
+  totals,
   windowSteps,
   withFleet,
 } from './data'
 import { clusterRuns, slurmStatus } from './slurm'
-import { HUE, bar as svgBar, gpus as svgGpus, pills, ring, spark, stepper } from './svg'
+import { HUE, bar as svgBar, gpus as svgGpus, meters, pills, ring, stepper } from './svg'
 
 export { span } from './data'
 
@@ -87,7 +89,6 @@ let isWatching = false
 let digesting: Promise<void> | undefined
 // The last attempt per project, so a failing model is asked again only after an hour.
 const tried = new Map<string, { sig: string; at: number }>()
-let previous: Map<string, RunStatus> | undefined
 
 // The project's own file may name another hub or status folder. Its machines
 // do not narrow the view: every session reads every project's (withFleet).
@@ -207,15 +208,17 @@ function mergeHosts(hosts: HostState[], runs: Run[]): { hosts: HostState[]; runs
 }
 
 // A refresh asked while one runs waits for that one instead of starting another.
-function refresh($: EngineInterface, base: Options): Promise<void> {
-  fetching ??= fetchAll($, base).finally(() => (fetching = undefined))
+// A refresh the person asked for shows 同步中…; the timer and start-up ones
+// fetch quietly, so the pane redraws once, when the new data is in.
+function refresh($: EngineInterface, base: Options, isAsked = false): Promise<void> {
+  fetching ??= fetchAll($, base, false, isAsked).finally(() => (fetching = undefined))
   return fetching
 }
 
 const sameFleet = (a: Fleet, b: Fleet) =>
   a.workers.join(' ') === b.workers.join(' ') && a.clusters.join(' ') === b.clusters.join(' ')
 
-async function fetchAll($: EngineInterface, base: Options, isAgain = false) {
+async function fetchAll($: EngineInterface, base: Options, isAgain = false, isAsked = false) {
   const had = await read($, setup)
   if (had.cwd) await loadSetup($, had.cwd)
   const { state, config } = await read($, setup)
@@ -223,7 +226,7 @@ async function fetchAll($: EngineInterface, base: Options, isAgain = false) {
   if (state !== 'ready' && !isWatching) return
   const known = ((await $.store.get('fleet')) ?? { workers: [], clusters: [] }) as Fleet
   const opts = withFleet(effective(base, config), known)
-  await update($, snapshot, snap => ({ ...snap, isFetching: true }))
+  if (isAsked && !isAgain) await update($, snapshot, snap => ({ ...snap, isFetching: true }))
   try {
     const ran = await $.process.run(onHub(opts), { stdin: hubScript(opts), timeoutMs: 90_000 })
     const parsed = parse(ran.stdout)
@@ -234,7 +237,7 @@ async function fetchAll($: EngineInterface, base: Options, isAgain = false) {
       await $.store.set('fleet', fleet)
       const wider = withFleet(effective(base, config), fleet)
       const isMissing = [...wider.workers, ...wider.clusters].some(host => ![...opts.workers, ...opts.clusters].includes(host))
-      if (isMissing && !isAgain) return await fetchAll($, base, true)
+      if (isMissing && !isAgain) return await fetchAll($, base, true, isAsked)
     }
     const merged = mergeHosts(parsed.hosts, parsed.runs)
     const dismissed = ((await $.store.get('dismissed')) ?? {}) as Dismissed
@@ -263,7 +266,7 @@ async function fetchAll($: EngineInterface, base: Options, isAgain = false) {
       error: failure,
     }))
     if (!failure) await $.store.set('snapshot', next)
-    announce($, runs)
+    await announce($, runs)
     digesting ??= digestAll($, opts, parsed.notes).finally(() => (digesting = undefined))
   } catch (error) {
     await update($, snapshot, snap => ({ ...snap, isFetching: false, error: String(error).slice(0, 200) }))
@@ -279,7 +282,7 @@ async function digestAll($: EngineInterface, opts: Options, notes: Notes[]) {
     const one = views.find(view => view.project === note.project)
     if (!one) continue
     // The lines describe the records and what runs now: either changing asks again.
-    const sig = `${note.sig}#${one.live.map(run => run.id).sort().join(',')}`
+    const sig = `v2|${note.sig}#${one.live.map(run => run.id).sort().join(',')}`
     const cached = (await $.store.get(`digest:${note.project}`)) as Digest | undefined
     let digest = cached?.sig === sig ? cached : undefined
     const last = tried.get(note.project)
@@ -341,18 +344,26 @@ async function archive($: EngineInterface, base: Options, runs: Run[], planOf?: 
   )
 }
 
-// The first fetch after a load is the baseline: only later changes notify.
-function announce($: EngineInterface, runs: Run[]) {
-  if (previous) {
-    for (const run of runs) {
-      if (previous.get(runKey(run)) === run.status) continue
-      if (run.status !== 'done' && run.status !== 'failed') continue
-      const text = `${ICON[run.status]} ${run.project} · ${run.name} ${run.status === 'done' ? '已完成' : '失败'}`
-      void $.ui.toast(text)
-      void $.ui.notify(text, { title: TITLE })
-    }
+// Each finished or failed run is announced once, by whichever session sees it
+// first: the record is shared, so switching sessions repeats nothing. Only a
+// run that ended in the last six hours is news; the first record ever is a
+// baseline that announces nothing.
+async function announce($: EngineInterface, runs: Run[]) {
+  const at = Math.floor(Date.now() / 1000)
+  const had = (await $.store.get('announced')) as Record<string, number> | undefined
+  const next: Record<string, number> = {}
+  for (const [key, when] of Object.entries(had ?? {})) if (at - when < 7 * 86400) next[key] = when
+  for (const run of runs) {
+    if (run.status !== 'done' && run.status !== 'failed') continue
+    const key = `${runKey(run)}|${run.status}`
+    if (next[key] !== undefined) continue
+    next[key] = at
+    if (!had || at - (run.finished ?? run.updated ?? 0) > 6 * 3600) continue
+    const text = `${ICON[run.status]} ${shortName(run.name)} ${run.status === 'done' ? '已完成' : '失败'}`
+    void $.ui.toast(text)
+    void $.ui.notify(text, { title: TITLE })
   }
-  previous = new Map(runs.map(run => [runKey(run), run.status]))
+  await $.store.set('announced', next)
 }
 
 const gb = (mib?: number) => (mib === undefined ? '?' : `${Math.round(mib / 1024)}G`)
@@ -387,14 +398,14 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'exp' }, async $ => {
     isWatching = true
     await $.ui.open({ id: PANE, title: TITLE })
-    void refresh($, opts)
+    void refresh($, opts, true)
 
     return { text: '实验进度面板已打开，正在刷新。' }
   })
 
   on('command.run', { command: 'exp-status' }, async $ => {
     isWatching = true
-    await refresh($, opts)
+    await refresh($, opts, true)
     // The summary waits for the lines the model is writing, if any.
     await digesting
     const { config } = await read($, setup)
@@ -418,7 +429,7 @@ export const register: Register = (on, options) => {
     const openPane = () => {
       isWatching = true
       void $.ui.open({ id: PANE, title: TITLE })
-      void refresh($, opts)
+      void refresh($, opts, true)
     }
     const openButton = <Button key="exp-open" label="实验面板" variant="primary" onPress={openPane} />
 
@@ -475,9 +486,10 @@ export const register: Register = (on, options) => {
     const here = await read($, setup)
     const eff = effective(opts, here.config)
     const now = Math.floor(Date.now() / 1000)
-    const cols = Math.max(20, e.props.bodyColumns ?? 40)
+    const cols = Math.max(24, e.props.bodyColumns ?? 40)
     // A pixel is about a seventh of a cell in the app's panes.
     const px = Math.max(160, cols * 7)
+    const isNarrow = cols < 44
     const mine = here.config.project
     // The session's own project leads, open; the rest follow by activity.
     const all = [...viewsOf(snap, eff)].sort((a, b) => Number(b.project === mine) - Number(a.project === mine))
@@ -491,45 +503,65 @@ export const register: Register = (on, options) => {
     const set = (change: (one: View) => View) => void update($, view, change)
     const toggleIn = (list: string[], id: string) => (list.includes(id) ? list.filter(one => one !== id) : [...list, id])
     const down = snap.hosts.filter(host => !host.isOk)
-    const live = all.reduce((n, one) => n + one.live.length, 0)
-    const gpuCount = snap.hosts.reduce((n, host) => n + (host.gpus?.length ?? 0), 0)
-    const busy = snap.hosts.reduce((n, host) => n + (host.gpus?.filter(gpu => gpu.util >= 10).length ?? 0), 0)
-    // A run that names no machine of its own is shown by the machine it was read on.
-    const machine = new Map(snap.hosts.flatMap(host => [host.host, ...(host.aliases ?? [])].map(alias => [alias, host.hostname ?? host.host] as const)))
-    const hostOf = (run: Run) => (run.host === run.where ? machine.get(run.where) ?? run.host : run.host)
+    const sum = totals(all, now)
+    const gpuAll = snap.hosts.flatMap(host => host.gpus ?? [])
+    const gpuBusy = gpuAll.filter(gpu => gpu.util >= 10).length
+    const hub = snap.hosts.find(host => host.host === 'local')?.hostname ?? 'local'
+    // A run's place in a few letters: a cluster job's node, else the alias it was read through.
+    const placeOf = (run: Run) => {
+      const place = run.slurm?.node ?? (run.host !== run.where ? run.host : run.where === 'local' ? hub : run.where)
+      return place.length > 10 ? `${place.slice(0, 9)}…` : place
+    }
+    const dateOf = (sec: number) => {
+      const d = new Date(sec * 1000)
+      return `${d.getMonth() + 1}-${d.getDate()} ${clock(sec)}`
+    }
+    const short = (sec: number) => span(sec).replace('<30min', '<30m')
 
-    const bar = (ratio: number, width: number, hue: string, theme: string) => {
-      if (Svg) return <Svg source={svgBar(ratio, width, hue)} alt={pct(ratio)} width={width} height={4} />
-      const [full, empty] = lineBar(ratio, Math.max(4, cols - 2))
-      return (
-        <Text>
-          <Text color={theme}>{full}</Text>
-          <Text dimColor>{empty}</Text>
+    const strip = (items: { n: number; label: string; color: string; theme: string }[], key: string) => {
+      const shown = items.filter(item => item.n > 0)
+      if (shown.length === 0) return null
+      const drawn = Svg ? pills(shown.map(item => ({ count: item.n, label: item.label, color: item.color }))) : undefined
+      // Wider than the pane, the strip scales down whole rather than losing its end.
+      const scale = drawn ? Math.min(1, px / drawn.width) : 1
+      return Svg && drawn ? (
+        <Svg
+          key={key}
+          source={drawn.source}
+          alt={shown.map(item => `${item.n} ${item.label}`).join(' · ')}
+          width={Math.floor(drawn.width * scale)}
+          height={Math.ceil(drawn.height * scale)}
+        />
+      ) : (
+        <Text key={key}>
+          {shown.map((item, i) => (
+            <Text>
+              {i > 0 ? '  ' : ''}
+              <Text color={item.theme}>{item.n}</Text>
+              <Text dimColor> {item.label}</Text>
+            </Text>
+          ))}
         </Text>
       )
     }
 
-    const tab = (id: View['tab'], label: string, count: string) => (
+    const tab = (id: View['tab'], label: string) => (
       <Button key={`tab-${id}`} plain onPress={() => set(one => ({ ...one, tab: id }))}>
         <Text bold={ui.tab === id} dimColor={ui.tab !== id} underline={ui.tab === id}>
           {label}
         </Text>
-        <Text dimColor> {count}</Text>
       </Button>
     )
 
     const header = (
       <Box flexDirection="row" justifyContent="space-between" alignItems="center">
         <Box flexDirection="row" gap={2}>
-          {tab('exp', '实验', `${live} 运行`)}
-          {tab('srv', '服务器', gpuCount ? `${busy}/${gpuCount} 卡忙` : `${snap.hosts.length} 台`)}
+          {tab('exp', '任务')}
+          {tab('srv', '资源')}
         </Box>
-        <Box flexDirection="row" gap={1} alignItems="center">
-          <Text dimColor>{snap.isFetching ? '同步中…' : snap.fetchedAt ? clock(snap.fetchedAt) : ''}</Text>
-          <Button key="refresh" hotkey="r" plain onPress={() => void refresh($, opts)}>
-            <Text dimColor>⟳</Text>
-          </Button>
-        </Box>
+        <Button key="refresh" hotkey="r" plain onPress={() => void refresh($, opts, true)}>
+          <Text dimColor>{snap.isFetching ? '同步中…' : snap.fetchedAt ? `${clock(snap.fetchedAt)} ⟳` : '⟳'}</Text>
+        </Button>
       </Box>
     )
 
@@ -543,55 +575,65 @@ export const register: Register = (on, options) => {
         )}
         {here.state === 'started' && <Text dimColor>cc 正在初始化本项目…</Text>}
         {snap.error && <Text color="error">同步失败：{snap.error}</Text>}
-        {ui.tab === 'exp' && down.length > 0 && (
+        {down.length > 0 && ui.tab === 'exp' && (
           <Button key="down" plain onPress={() => set(one => ({ ...one, tab: 'srv' }))}>
-            <Text color="warning">⚠ {down.map(host => host.host).join('、')} 连不上</Text>
-            <Text dimColor> · 看服务器</Text>
+            <Text color="warning">⚠ {down.length} 台机器连不上</Text>
           </Button>
         )}
       </Box>
     )
 
-    // Where a run is: a cluster job by its node, as a run elsewhere is by its machine.
-    const placeOf = (run: Run) => run.slurm?.node ?? hostOf(run)
-    const dateOf = (sec: number) => {
-      const d = new Date(sec * 1000)
-      return `${d.getMonth() + 1}-${d.getDate()} ${clock(sec)}`
-    }
+    const miniBar = (ratio: number, hue: string, theme: string, width = 46) =>
+      Svg ? (
+        <Svg source={svgBar(ratio, width, hue, 4)} alt={pct(ratio)} width={width} height={4} />
+      ) : (
+        <Text>
+          <Text color={theme}>{lineBar(ratio, 6)[0]}</Text>
+          <Text dimColor>{lineBar(ratio, 6)[1]}</Text>
+        </Text>
+      )
 
-    const runRow = (run: Run) => {
+    // A run in one line, its columns aligned: state, name, place, bar, %, time.
+    const runLine = (run: Run) => {
       const stale = isStale(run, snap.fetchedAt, eff)
-      const ratio = runRatio(run) ?? 0
-      const hue = stale ? HUE.stale : HUE.running
-      const trend = Svg && run.spark ? spark(run.spark, 52, 14, hue) : undefined
       const hasSteps = Boolean(run.total && run.step !== undefined)
-      const hint = stale ? `停滞 ${span(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}` : leftText(run, now)
+      const ratio = runRatio(run) ?? 0
+      const left = eta(run, now)
+      const time = stale
+        ? `停 ${short(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}`
+        : left !== undefined
+          ? left === 0
+            ? '将完成'
+            : short(left)
+          : hasSteps
+            ? '估算中'
+            : run.started !== undefined
+              ? `已 ${short(now - run.started)}`
+              : ''
       return (
-        <Box key={`run-${runKey(run)}`} flexDirection="column">
-          <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexShrink={1}>
-              <Text wrap="truncate">
-                {run.name} <Text dimColor>{placeOf(run)}</Text>
+        <Box key={`run-${runKey(run)}`} flexDirection="row" alignItems="center" gap={1}>
+          <Text color={stale ? 'warning' : 'suggestion'}>●</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text wrap="truncate-middle">{shortName(run.name)}</Text>
+          </Box>
+          {!isNarrow && (
+            <Box width={10} flexShrink={0}>
+              <Text dimColor wrap="truncate">
+                {placeOf(run)}
               </Text>
             </Box>
-            <Text>
-              {hasSteps ? <Text bold>{pct(ratio)}</Text> : ''}
-              {hint && (
-                <Text color={stale ? 'warning' : undefined} dimColor={!stale}>
-                  {'  '}
-                  {hint}
-                </Text>
-              )}
+          )}
+          <Box width={7} flexShrink={0}>
+            {hasSteps ? miniBar(ratio, stale ? HUE.stale : HUE.running, stale ? 'warning' : 'suggestion') : <Text dimColor>{Svg ? '' : '      '}</Text>}
+          </Box>
+          <Box width={4} flexShrink={0} justifyContent="flex-end">
+            <Text bold>{hasSteps ? pct(ratio) : ''}</Text>
+          </Box>
+          <Box width={7} flexShrink={0} justifyContent="flex-end">
+            <Text dimColor={!stale} color={stale ? 'warning' : undefined}>
+              {time}
             </Text>
           </Box>
-          {hasSteps ? (
-            <Box flexDirection="row" gap={1} alignItems="center">
-              {bar(ratio, trend ? px - 60 : px, hue, stale ? 'warning' : 'suggestion')}
-              {Svg && trend && <Svg source={trend} alt={`${run.sparkName ?? ''} 走势`} width={52} height={14} />}
-            </Box>
-          ) : (
-            <Text dimColor>{run.started !== undefined ? `进度未上报 · 已运行 ${span(now - run.started)}` : '进度未上报'}</Text>
-          )}
         </Box>
       )
     }
@@ -601,42 +643,29 @@ export const register: Register = (on, options) => {
       const kind = lost ? 'lost' : run.status
       const stage = one.digest?.short?.[run.stage] ?? one.stages.find(s => s.id === run.stage)?.title ?? run.stage
       const took = run.started !== undefined ? (run.finished ?? run.updated ?? run.started) - run.started : undefined
-      const first = Object.entries(run.metrics ?? {})[0]
-      const result = first ? `${first[0]} ${typeof first[1] === 'number' ? Number(first[1].toPrecision(4)) : first[1]}` : ''
       const job = run.slurm
       const when = lost
-        ? `失联 ${span(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}`
+        ? `失联 ${short(snap.fetchedAt - (run.updated ?? snap.fetchedAt))}`
         : run.status === 'queued'
-          ? ['排队中', job?.reason, job?.start ? `预计 ${dateOf(job.start)}` : ''].filter(Boolean).join(' · ')
+          ? ['排队', job?.reason, job?.start ? `预计 ${dateOf(job.start)}` : ''].filter(Boolean).join(' · ')
           : took !== undefined && took > 0
-            ? `用时 ${span(took)}`
+            ? `用时 ${short(took)}`
             : ''
+      const why = run.note && (run.status === 'failed' || run.status === 'killed') ? shortName(run.note) : ''
       return (
-        <Box key={`row-${runKey(run)}`} flexDirection="column">
-          <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexShrink={1}>
-              <Text wrap="truncate">
-                <Text color={COLOR[kind]}>{ICON[kind]}</Text> {run.name}
-              </Text>
-            </Box>
-            <Box flexDirection="row" gap={1}>
-              {result && <Text dimColor>{result}</Text>}
-              {run.file && (run.status !== 'running' || lost) ? (
-                <Button key={`rm-${runKey(run)}`} plain onPress={() => void archive($, opts, [run])}>
-                  <Text dimColor>✕</Text>
-                </Button>
-              ) : null}
-            </Box>
-          </Box>
-          <Text dimColor wrap="truncate">
-            {'  '}
-            {[stage, placeOf(run), when].filter(Boolean).join(' · ')}
-          </Text>
-          {run.note && (run.status === 'failed' || run.status === 'killed') && (
-            <Text color="error" wrap="truncate">
-              {'  '}
-              {run.note}
+        <Box key={`row-${runKey(run)}`} flexDirection="row" alignItems="center" gap={1}>
+          <Text color={COLOR[kind]}>{ICON[kind]}</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text wrap="truncate">
+              {shortName(run.name)}
+              <Text dimColor> {[stage, placeOf(run), when].filter(Boolean).join(' · ')}</Text>
+              {why && <Text color="error"> {why}</Text>}
             </Text>
+          </Box>
+          {(run.status !== 'running' || lost) && (
+            <Button key={`rm-${runKey(run)}`} plain onPress={() => void archive($, opts, [run])}>
+              <Text dimColor>✕</Text>
+            </Button>
           )}
         </Box>
       )
@@ -645,14 +674,6 @@ export const register: Register = (on, options) => {
     const card = (one: ProjectView) => {
       const doneStages = one.stages.filter(stage => stage.status === 'done').length
       const count = (status: RunStatus) => one.ended.filter(run => run.status === status).length
-      const kinds = [
-        { n: count('done'), label: '完成', color: HUE.done, theme: 'success' },
-        { n: count('failed'), label: '失败', color: HUE.failed, theme: 'error' },
-        { n: count('killed'), label: '中止', color: HUE.stale, theme: 'warning' },
-        { n: one.lost.length, label: '失联', color: HUE.stale, theme: 'warning' },
-        { n: one.queued.length, label: '排队', color: HUE.label, theme: 'subtle' },
-      ].filter(kind => kind.n > 0)
-      const badge = Svg && kinds.length ? pills(kinds.map(kind => ({ count: kind.n, label: kind.label, color: kind.color }))) : undefined
       const order: Record<string, number> = { lost: 0, failed: 1, killed: 2, queued: 3, done: 4 }
       const listed = [...one.lost, ...one.ended, ...one.queued].sort(
         (a, b) =>
@@ -663,21 +684,35 @@ export const register: Register = (on, options) => {
       const isManage = ui.manage === one.project
       const clearable = [...one.ended, ...one.lost]
       const showAll = ui.more.includes(one.project)
-      const shownLive = showAll ? one.live : one.live.slice(0, 4)
-      const doing = one.digest?.now ? `正在 · ${one.digest.now}` : one.current ? `当前 · ${one.current.title}` : ''
-      const nextLine = one.digest?.next ? `下一步 · ${one.digest.next}` : one.current?.goal ?? ''
+      const shownLive = showAll ? one.live : one.live.slice(0, 6)
+      const doing = one.digest?.now ?? one.current?.title
       const room = Math.max(3, Math.min(7, Math.floor(px / 62)))
+      const ended = strip(
+        [
+          { n: count('done'), label: '完成', color: HUE.done, theme: 'success' },
+          { n: count('failed'), label: '失败', color: HUE.failed, theme: 'error' },
+          { n: count('killed'), label: '中止', color: HUE.stale, theme: 'warning' },
+          { n: one.lost.length, label: '失联', color: HUE.stale, theme: 'warning' },
+          { n: one.queued.length, label: '排队', color: HUE.label, theme: 'subtle' },
+        ],
+        `ended-${one.project}`,
+      )
 
       return (
         <Box key={`card-${one.project}`} flexDirection="column" gap={1}>
           <Box flexDirection="row" gap={1} alignItems="center">
             {Svg && one.stages.length > 0 && (
-              <Svg source={ring(one.ratio, 34, HUE.accent)} alt={`总进度 ${pct(one.ratio)}`} width={34} height={34} />
+              <Svg source={ring(one.ratio, 28, HUE.accent)} alt={`总进度 ${pct(one.ratio)}`} width={28} height={28} />
             )}
             <Box flexDirection="column" flexGrow={1} flexShrink={1}>
               <Text bold wrap="truncate">
                 {one.title}
-                {!Svg && <Text dimColor> · {pct(one.ratio)}</Text>}
+                {one.stages.length > 0 && (
+                  <Text dimColor>
+                    {'  '}
+                    {Svg ? '' : `${pct(one.ratio)} · `}阶段 {doneStages}/{one.stages.length}
+                  </Text>
+                )}
               </Text>
               {doing && (
                 <Text dimColor wrap="truncate">
@@ -689,48 +724,27 @@ export const register: Register = (on, options) => {
               <Text dimColor>▴</Text>
             </Button>
           </Box>
-          {one.stages.length === 0 ? null : Svg ? (
+          {one.stages.length > 0 && Svg && (
             <Svg
               source={stepper(windowSteps(one, room), px)}
               alt={one.stages.map(stage => `${stage.status === 'done' ? '✔' : stage.id === one.current?.id ? '●' : '○'}${stage.title}`).join(' ')}
               width={px}
               height={42}
             />
-          ) : (
-            <Text dimColor wrap="wrap">
-              阶段 {doneStages}/{one.stages.length} · {windowSteps(one, 5).map(step => `${step.status === 'done' ? '✔' : step.isCurrent ? '●' : '○'}${step.title}`).join(' ')}
-            </Text>
-          )}
-          {nextLine && (
-            <Text dimColor wrap="truncate">
-              {nextLine}
-            </Text>
           )}
           {one.live.length > 0 && (
-            <Box flexDirection="column" gap={1}>
-              {shownLive.map(runRow)}
-              {one.live.length > 4 && (
+            <Box flexDirection="column">
+              {shownLive.map(runLine)}
+              {one.live.length > 6 && (
                 <Button key={`more-${one.project}`} plain onPress={() => set(v => ({ ...v, more: toggleIn(v.more, one.project) }))}>
-                  <Text dimColor>{showAll ? '收起' : `还有 ${one.live.length - 4} 个运行中 ▾`}</Text>
+                  <Text dimColor>{showAll ? '收起' : `还有 ${one.live.length - 6} 个 ▾`}</Text>
                 </Button>
               )}
             </Box>
           )}
-          {(kinds.length > 0 || one.plan) && (
+          {(ended || one.plan) && (
             <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-              {Svg && badge ? (
-                <Svg source={badge.source} alt={kinds.map(kind => `${kind.n} ${kind.label}`).join(' · ')} width={badge.width} height={badge.height} />
-              ) : (
-                <Text>
-                  {kinds.map((kind, i) => (
-                    <Text>
-                      {i > 0 ? '  ' : ''}
-                      <Text color={kind.theme}>{kind.n}</Text>
-                      <Text dimColor> {kind.label}</Text>
-                    </Text>
-                  ))}
-                </Text>
-              )}
+              {ended ?? <Text> </Text>}
               <Box flexDirection="row" gap={2}>
                 {listed.length > 0 && (
                   <Button key={`detail-${one.project}`} plain onPress={() => set(v => ({ ...v, detail: toggleIn(v.detail, one.project) }))}>
@@ -748,30 +762,25 @@ export const register: Register = (on, options) => {
             </Box>
           )}
           {isManage && (
-            <Box flexDirection="column" gap={1}>
-              <Text dimColor wrap="wrap">
-                清理和归档都只是把状态文件移到 {eff.statusDir}/archive/日期/，随时可以找回。
-              </Text>
-              <Box flexDirection="row" gap={1} flexWrap="wrap">
-                {clearable.length > 0 &&
-                  (ui.confirm === `clear:${one.project}` ? (
-                    <Button key={`clear-${one.project}`} label={`确认清理 ${clearable.length} 个`} variant="primary" onPress={() => void archive($, opts, clearable)} />
-                  ) : (
-                    <Button key={`clear-${one.project}`} label={`清理已结束 ${clearable.length}`} onPress={() => set(v => ({ ...v, confirm: `clear:${one.project}` }))} />
-                  ))}
-                {ui.confirm === `archive:${one.project}` ? (
-                  <Button key={`archive-${one.project}`} label={`确认归档整个项目（${one.runs.length + 1} 个文件）`} variant="primary" onPress={() => void archive($, opts, one.runs, one)} />
+            <Box flexDirection="row" gap={1} flexWrap="wrap">
+              {clearable.length > 0 &&
+                (ui.confirm === `clear:${one.project}` ? (
+                  <Button key={`clear-${one.project}`} label={`确认清理 ${clearable.length} 个`} variant="primary" onPress={() => void archive($, opts, clearable)} />
                 ) : (
-                  <Button key={`archive-${one.project}`} label="归档整个项目" onPress={() => set(v => ({ ...v, confirm: `archive:${one.project}` }))} />
-                )}
-                <Button key={`cancel-${one.project}`} label="取消" role="dismiss" onPress={() => set(v => ({ ...v, manage: undefined, confirm: undefined }))} />
-              </Box>
+                  <Button key={`clear-${one.project}`} label={`清理已结束 ${clearable.length}`} onPress={() => set(v => ({ ...v, confirm: `clear:${one.project}` }))} />
+                ))}
+              {ui.confirm === `archive:${one.project}` ? (
+                <Button key={`archive-${one.project}`} label="确认归档项目" variant="primary" onPress={() => void archive($, opts, one.runs, one)} />
+              ) : (
+                <Button key={`archive-${one.project}`} label="归档项目" onPress={() => set(v => ({ ...v, confirm: `archive:${one.project}` }))} />
+              )}
+              <Button key={`cancel-${one.project}`} label="取消" role="dismiss" onPress={() => set(v => ({ ...v, manage: undefined, confirm: undefined }))} />
             </Box>
           )}
           {isDetail && (
-            <Box flexDirection="column" gap={1}>
+            <Box flexDirection="column">
               {listed.slice(0, 15).map(run => detailRow(one, run))}
-              {listed.length > 15 && <Text dimColor>…共 {listed.length} 个，较早的可在“管理”里一并清理</Text>}
+              {listed.length > 15 && <Text dimColor>…共 {listed.length} 个，其余可在“管理”里一并清理</Text>}
             </Box>
           )}
         </Box>
@@ -781,18 +790,18 @@ export const register: Register = (on, options) => {
     const row = (one: ProjectView) => {
       const lefts = one.live.map(run => eta(run, now)).filter((t): t is number => t !== undefined)
       const state = one.live.length
-        ? `${one.live.length} 运行${lefts.length ? ` · 剩 ${span(Math.min(...lefts))}` : ''}`
+        ? `${one.live.length} 运行${lefts.length ? ` · ${short(Math.min(...lefts))}` : ''}`
         : one.queued.length
           ? `${one.queued.length} 排队`
           : one.plan?.status === 'done'
             ? '已完成'
             : one.plan?.status === 'failed'
               ? '已终止'
-              : '无运行'
+              : '空闲'
       return (
         <Box key={`row-${one.project}`} flexDirection="row" alignItems="center" gap={1}>
           {Svg ? (
-            <Svg source={ring(one.ratio, 16, one.live.length ? HUE.accent : HUE.label, false)} alt={pct(one.ratio)} width={16} height={16} />
+            <Svg source={ring(one.ratio, 14, one.live.length ? HUE.accent : HUE.label, false)} alt={pct(one.ratio)} width={14} height={14} />
           ) : (
             <Text color={one.live.length ? 'suggestion' : 'subtle'}>{one.live.length ? '●' : '○'}</Text>
           )}
@@ -806,15 +815,25 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const experiments = (
+    const tasks = (
       <Box flexDirection="column" gap={1}>
+        {strip(
+          [
+            { n: sum.running, label: '运行', color: HUE.running, theme: 'suggestion' },
+            { n: sum.queued, label: '排队', color: HUE.label, theme: 'subtle' },
+            { n: sum.doneToday, label: '今日完成', color: HUE.done, theme: 'success' },
+            { n: sum.failed, label: '失败', color: HUE.failed, theme: 'error' },
+            { n: sum.lost, label: '失联', color: HUE.stale, theme: 'warning' },
+          ],
+          'totals',
+        )}
         {snap.fetchedAt > 0 && all.length === 0 && <Text dimColor>还没有实验上报状态。</Text>}
         {active.map(one => (one.project === open ? card(one) : row(one)))}
         {idle.length > 0 && (
           <Box flexDirection="column" gap={1}>
             <Button key="idle" plain onPress={() => set(v => ({ ...v, showIdle: !v.showIdle }))}>
               <Text dimColor>
-                {ui.showIdle ? '▾' : '▸'} 闲置 {idle.length} 个项目
+                {ui.showIdle ? '▾' : '▸'} 闲置 {idle.length}
               </Text>
             </Button>
             {ui.showIdle && idle.map(one => (one.project === open ? card(one) : row(one)))}
@@ -830,36 +849,56 @@ export const register: Register = (on, options) => {
       return Svg && drawn ? (
         <Svg
           source={drawn.source}
-          alt={rows.map(row => `${row.label} ${row.util}% ${gb(row.memUsed)}/${gb(row.memTotal)} ${row.note}`).join('；')}
+          alt={rows.map(one => `${one.label} ${one.util}% ${gb(one.memUsed)}/${gb(one.memTotal)} ${one.note}`).join('；')}
           width={px}
           height={drawn.height}
         />
       ) : (
-        rows.map(row => (
+        rows.map(one => (
           <Text wrap="truncate">
-            <Text dimColor>{row.label} </Text>
-            <Text color={row.util >= 60 ? 'suggestion' : 'subtle'}>{lineBar(row.util / 100, 8)[0]}</Text>
-            <Text dimColor>{lineBar(row.util / 100, 8)[1]}</Text> {row.util}%
-            <Text dimColor={!row.warn} color={row.warn ? 'warning' : undefined}>
+            <Text dimColor>{one.label} </Text>
+            <Text color={one.util >= 60 ? 'suggestion' : 'subtle'}>{lineBar(one.util / 100, 8)[0]}</Text>
+            <Text dimColor>{lineBar(one.util / 100, 8)[1]}</Text> {one.util}%
+            <Text dimColor={!one.warn} color={one.warn ? 'warning' : undefined}>
               {' '}
-              {gb(row.memUsed)}/{gb(row.memTotal)} · {row.note}
+              {gb(one.memUsed)}/{gb(one.memTotal)} · {one.note}
             </Text>
           </Text>
         ))
       )
     }
 
-    const hostHead = (name: string, aliases: string, isOk: boolean, right: string) => (
-      <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Box flexShrink={1}>
-          <Text wrap="truncate">
-            <Text color={isOk ? 'success' : 'warning'}>●</Text> <Text bold>{name}</Text>
-            <Text dimColor> {aliases}</Text>
-          </Text>
+    // A machine's title line, btop-style: its name, and CPU and memory as meters.
+    const machineHead = (name: string, alias: string, isOk: boolean, cpu?: number, mem?: number) => {
+      const items = [
+        ...(cpu !== undefined ? [{ label: 'CPU', ratio: cpu }] : []),
+        ...(mem !== undefined ? [{ label: 'MEM', ratio: mem }] : []),
+      ]
+      const drawn = Svg && items.length ? meters(items) : undefined
+      return (
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+          <Box flexShrink={1}>
+            <Text wrap="truncate">
+              <Text color={isOk ? 'success' : 'warning'}>●</Text> <Text bold>{name}</Text>
+              {alias && <Text dimColor> {alias}</Text>}
+            </Text>
+          </Box>
+          {Svg && drawn ? (
+            <Svg source={drawn.source} alt={items.map(item => `${item.label} ${pct(item.ratio)}`).join(' ')} width={drawn.width} height={drawn.height} />
+          ) : (
+            <Text dimColor>{items.map(item => `${item.label} ${pct(item.ratio)}`).join('  ')}</Text>
+          )}
         </Box>
-        <Text dimColor>{right}</Text>
-      </Box>
-    )
+      )
+    }
+
+    // A machine by the shortest of its names: `gpu7` over `lab-Super-Server-7`
+    // and `me@10.0.0.7`, `cluster` over `university_cluster_gpu`.
+    const nameOfHost = (host: HostState) =>
+      [host.cluster?.name, host.hostname, host.host, ...(host.aliases ?? [])]
+        .filter((name): name is string => Boolean(name) && name !== 'local')
+        .map(name => name.replace(/^[^@]*@/, ''))
+        .sort((a, b) => a.length - b.length)[0] ?? host.host
 
     // A Slurm cluster drawn as a machine: its GPUs are the ones the person's
     // running jobs hold, each with what it does and the time its job has left.
@@ -868,18 +907,20 @@ export const register: Register = (on, options) => {
       const gpuUsed = c.nodes.reduce((n, node) => n + node.gpusUsed, 0)
       const cpus = c.nodes.reduce((n, node) => n + node.cpus, 0)
       const cpusUsed = c.nodes.reduce((n, node) => n + node.cpusUsed, 0)
+      const memAll = c.nodes.reduce((n, node) => n + node.memTotal, 0)
+      const memUsed = c.nodes.reduce((n, node) => n + node.memAlloc, 0)
       const running = c.mine.filter(job => slurmStatus(job.state) === 'running')
       const pending = c.mine.filter(job => slurmStatus(job.state) === 'queued')
       const mineGpus = running.reduce((n, job) => n + job.gpus, 0)
       const rows: GpuRow[] = []
-      const cpuJobs: { name: string; node?: string; note: string; warn: boolean }[] = []
+      const cpuJobs: { name: string; note: string; warn: boolean }[] = []
       for (const job of running) {
         const left = job.limit !== undefined ? job.limit - job.elapsed - (now - snap.fetchedAt) : undefined
         const isSoon = left !== undefined && left < 12 * 3600
-        const limit = left === undefined ? '无时限' : `时限剩 ${span(Math.max(0, left))}`
+        const limit = left === undefined ? '无时限' : `剩 ${short(Math.max(0, left))}`
         const usage = job.usage?.length ? job.usage : Array.from({ length: job.gpus }, () => undefined)
         if (usage.length === 0) {
-          cpuJobs.push({ name: job.name, node: job.node, note: limit, warn: isSoon })
+          cpuJobs.push({ name: job.name, note: limit, warn: isSoon })
           continue
         }
         for (const gpu of usage) {
@@ -894,72 +935,63 @@ export const register: Register = (on, options) => {
           })
         }
       }
-      const right = [
-        cpus ? `CPU ${Math.round((cpusUsed / cpus) * 100)}%` : '',
-        gpuTotal ? `GPU ${gpuUsed}/${gpuTotal} 已分配` : '',
-      ]
-        .filter(Boolean)
-        .join(' · ')
-      const rest = gpuTotal
-        ? `其余 ${Math.max(0, gpuUsed - mineGpus)} 卡被他人占用 · ${gpuTotal - gpuUsed} 卡空闲 · 排队 ${c.pending}`
-        : `全部 ${c.running} 运行 · ${c.pending} 排队`
       return (
         <Box key={`cluster-${host.host}`} flexDirection="column">
-          {hostHead(c.name ?? host.host, host.host, true, right)}
+          {machineHead(nameOfHost(host), 'Slurm', true, cpus ? cpusUsed / cpus : undefined, memAll ? memUsed / memAll : undefined)}
           {rows.length > 0 && gpuRows(rows)}
           {cpuJobs.map(job => (
             <Text wrap="truncate" dimColor={!job.warn} color={job.warn ? 'warning' : undefined}>
-              {job.name}
-              {job.node ? ` · ${job.node}` : ''} · {job.note}
+              {job.name} · {job.note}
             </Text>
           ))}
-          {pending.length > 0 && (
-            <Text dimColor wrap="truncate">
-              排队 {pending.length}：
-              {pending.map(job => `${job.name}（${[job.reason, job.start ? `预计 ${dateOf(job.start)}` : ''].filter(Boolean).join(' · ')}）`).join('、')}
-              {c.fairShare !== undefined ? ` · 公平份额 ${c.fairShare.toFixed(3)}` : ''}
-            </Text>
-          )}
           <Text dimColor wrap="truncate">
-            {rest}
+            {gpuTotal ? `GPU ${gpuUsed}/${gpuTotal} 已分配 · 你 ${mineGpus} · 空闲 ${gpuTotal - gpuUsed}` : `${c.running} 运行`}
+            {` · 排队 ${c.pending}`}
+            {pending.length ? `（你 ${pending.length}${pending[0]?.reason ? ` · ${pending[0].reason}` : ''}）` : ''}
           </Text>
         </Box>
       )
     }
 
-    const hasRows = snap.hosts.some(host => (host.gpus?.length ?? 0) > 0 || host.cluster?.mine.some(job => job.gpus > 0))
-    const servers = (
+    const resources = (
       <Box flexDirection="column" gap={1}>
-        {snap.hosts.length === 0 && <Text dimColor>还没有服务器信息，按 ⟳ 同步。</Text>}
-        {snap.hosts.map(host => {
-          if (host.cluster) return clusterCard(host, host.cluster)
-          const load = host.load !== undefined && host.cpus ? `CPU ${Math.round((host.load / host.cpus) * 100)}%` : ''
-          const mem = host.memAvail !== undefined ? `${gb(host.memAvail)} 内存空闲` : ''
-          const list = host.gpus ?? []
-          const aliases = [host.host, ...(host.aliases ?? [])].filter(name => name !== host.hostname).join(' / ')
-          return (
-            <Box key={`host-${host.host}`} flexDirection="column">
-              {hostHead(host.hostname ?? host.host, aliases, host.isOk, [load, mem].filter(Boolean).join(' · '))}
-              {!host.isOk && (
-                <Text color="warning" wrap="truncate">
-                  连不上：{host.error}
-                </Text>
-              )}
-              {list.length > 0 &&
-                gpuRows(
-                  list.map(gpu => ({
-                    label: String(gpu.index),
-                    util: gpu.util,
-                    memUsed: gpu.memUsed,
-                    memTotal: gpu.memTotal,
-                    note: gpu.users.join(',') || '空闲',
-                  })),
-                )}
-              {host.isOk && list.length === 0 && <Text dimColor>没有 GPU 或读不到 nvidia-smi</Text>}
-            </Box>
-          )
-        })}
-        {hasRows && <Text dimColor>每行：卡号或节点 · 利用率 · 显存 · 占用者或作业</Text>}
+        {strip(
+          [
+            { n: gpuBusy, label: `卡在忙 · 共 ${gpuAll.length}`, color: HUE.running, theme: 'suggestion' },
+            { n: snap.hosts.length - down.length, label: '台在线', color: HUE.done, theme: 'success' },
+            { n: down.length, label: '台连不上', color: HUE.stale, theme: 'warning' },
+          ],
+          'machines',
+        )}
+        {snap.hosts.length === 0 && <Text dimColor>还没有机器信息，按 ⟳ 同步。</Text>}
+        {snap.hosts
+          .filter(host => host.isOk)
+          .map(host => {
+            if (host.cluster) return clusterCard(host, host.cluster)
+            const list = host.gpus ?? []
+            const cpu = host.cpuPct !== undefined ? host.cpuPct / 100 : host.load !== undefined && host.cpus ? host.load / host.cpus : undefined
+            const mem = host.memTotal && host.memAvail !== undefined ? 1 - host.memAvail / host.memTotal : undefined
+            return (
+              <Box key={`host-${host.host}`} flexDirection="column">
+                {machineHead(nameOfHost(host), '', true, cpu, mem)}
+                {list.length > 0 &&
+                  gpuRows(
+                    list.map(gpu => ({
+                      label: String(gpu.index),
+                      util: gpu.util,
+                      memUsed: gpu.memUsed,
+                      memTotal: gpu.memTotal,
+                      note: gpu.users.join(',') || '空闲',
+                    })),
+                  )}
+              </Box>
+            )
+          })}
+        {down.map(host => (
+          <Text key={`down-${host.host}`} color="warning" wrap="truncate">
+            ● {host.host} 连不上<Text dimColor> {host.error}</Text>
+          </Text>
+        ))}
       </Box>
     )
 
@@ -967,9 +999,8 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" gap={1}>
         {header}
         {notices}
-        {ui.tab === 'exp' ? experiments : servers}
+        {ui.tab === 'exp' ? tasks : resources}
       </Box>
     )
   })
 }
-
